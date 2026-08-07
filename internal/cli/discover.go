@@ -33,7 +33,7 @@ func newDiscoverCommand() *cobra.Command {
 		Long: "Resolve an A2A agent's card (from the well-known path or --card-url), " +
 			"present every section (identity, capabilities, interfaces, security schemes, " +
 			"skills), and show which transport the client would select. Use --validate to " +
-			"check the card against the A2A card schema, and -o json for machine-readable output.",
+			"check the card's required-field structure (a structural conformance aid, not a full JSON-Schema or security check), and -o json for machine-readable output.",
 		Args: func(_ *cobra.Command, args []string) error {
 			if len(args) != 0 {
 				return clierr.New(clierr.KindUsage, "discover takes no positional arguments")
