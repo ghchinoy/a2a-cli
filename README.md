@@ -11,8 +11,9 @@ result as readable text or machine-readable JSON. Built on the official
 > **Status: alpha.** This is an early build of a **Tier-1** A2A client. The full Tier-1 command
 > set is merged — **`send`**, **`discover`**, **`get`**, **`cancel`**, and **`session`** — over the
 > **HTTP+JSON** and **JSON-RPC** transports, including caller-supplied authentication and
-> card-gated SSE streaming (`send --stream`). gRPC, the bundled agent skill (`SKILL.md`), and the
-> Tier-1 conformance report are still to come. The `--output json` shape and the exit-code scheme
+> card-gated SSE streaming (`send --stream`). A bundled agent skill and self-installable plugin ship
+> in the repo ([`skill/SKILL.md`](skill/SKILL.md), [`plugin.json`](plugin.json)). gRPC and the Tier-1
+> conformance report are still to come. The `--output json` shape and the exit-code scheme
 > are a stable contract; everything else may change without notice while the
 > [a2a-cli spec](https://github.com/a2aproject/a2a-cli) is still a Draft.
 
@@ -255,9 +256,11 @@ Explicit flags and environment variables always override stored values.
 - [User guide](docs/user-guide.md) — install, quickstart, and worked examples for every command.
 - [Test plan](docs/test-plan.md) — validation and Tier-1 conformance walkthrough for reviewers and
   the conformance team.
+- [Changelog](CHANGELOG.md) — notable changes, curated per release.
+- [Agent skill](skill/SKILL.md) — a bundled, generic skill that teaches an agent to drive the CLI
+  non-interactively, packaged as a self-installable plugin via [`plugin.json`](plugin.json).
 
-A bundled agent skill (`SKILL.md`) and the Tier-1 compliance report are coming in later phases and
-will be linked here when they land.
+The Tier-1 compliance report is coming in a later phase and will be linked here when it lands.
 
 ## Development
 
@@ -279,7 +282,10 @@ The layout follows the design's package boundaries: `cmd/a2a-cli` (entry point) 
 
 This is an early-stage project under active phased development. Issues and pull requests are welcome;
 for larger changes, please open an issue first to discuss the approach. Keep documentation aligned
-with merged behavior — docs describe what the code does today, not planned features.
+with merged behavior — docs describe what the code does today, not planned features, and notable
+changes are curated in the [changelog](CHANGELOG.md). No release has been tagged yet: during the
+alpha, build from source (see [Installation](#installation)); tagged releases will appear here once
+the client leaves alpha.
 
 ## License
 

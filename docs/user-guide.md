@@ -5,8 +5,9 @@ through the options that matter day to day.
 
 > **What works today.** `a2a-cli` is in **alpha**, but the full Tier-1 command set is merged:
 > **`send`** (with `--stream`), **`discover`**, **`get`**, **`cancel`**, and **`session`**, over the
-> **HTTP+JSON** and **JSON-RPC** transports, plus caller-supplied authentication. gRPC, a bundled
-> agent skill, and interactive OAuth login are **not** available yet. Every runnable example below
+> **HTTP+JSON** and **JSON-RPC** transports, plus caller-supplied authentication. A bundled agent
+> skill and self-installable plugin ship in the repo ([`skill/SKILL.md`](../skill/SKILL.md),
+> [`plugin.json`](../plugin.json)). gRPC and interactive OAuth login are **not** available yet. Every runnable example below
 > was captured from the built binary run against a live Go sample server. A few behaviors that need
 > a richer fixture — auth enforcement, protocol-version negotiation, cross-origin credential
 > handling, and exit codes 4–7 — are described from the spec and implementation (unit-tested) and
@@ -581,8 +582,9 @@ Add `-v` for extra diagnostics on stderr while debugging.
 
 ## What's coming next
 
-The Tier-1 command surface is complete. Still to land: a bundled, self-installable agent skill
-(`SKILL.md`) and the Tier-1 conformance report, plus richer validation against an auth-enforcing and
+The Tier-1 command surface is complete, and a bundled, self-installable agent skill now ships in the
+repo ([`skill/SKILL.md`](../skill/SKILL.md), packaged as a plugin via [`plugin.json`](../plugin.json)).
+Still to land: the Tier-1 conformance report, plus richer validation against an auth-enforcing and
 multi-transport server. Beyond Tier 1, gRPC transport and interactive OAuth login are planned. This
 guide will be extended as each merges. Until then, treat any behavior not documented here as not yet
 available. Run `a2a-cli --help` or `a2a-cli <command> --help` to see the current surface at any time.
