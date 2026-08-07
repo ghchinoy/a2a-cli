@@ -23,7 +23,8 @@ import (
 	"github.com/ghchinoy/a2a-cli/internal/session"
 )
 
-// flagValidate is the discover-local flag that turns on card-schema validation.
+// flagValidate is the discover-local flag that turns on structural required-field
+// card validation (a conformance aid, not full JSON-Schema, not a security check).
 const flagValidate = "validate"
 
 func newDiscoverCommand() *cobra.Command {
