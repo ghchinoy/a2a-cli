@@ -13,11 +13,12 @@ package session
 
 import (
 	"encoding/json"
-	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
 	"time"
+
+	"github.com/ghchinoy/a2a-cli/internal/urlutil"
 )
 
 // SchemaVersion is the on-disk schema version for session.json.
@@ -76,7 +77,7 @@ func Path() (string, error) {
 func Save(s *Session) error {
 	s.SchemaVersion = SchemaVersion
 	s.UpdatedAt = time.Now().UTC()
-	s.ServiceURL = sanitizeURL(s.ServiceURL)
+	s.ServiceURL = urlutil.Sanitize(s.ServiceURL)
 
 	dir, err := Dir()
 	if err != nil {
@@ -117,20 +118,6 @@ func Save(s *Session) error {
 	}
 	// Enforce 0600 in case the destination pre-existed with looser perms.
 	return os.Chmod(final, 0o600)
-}
-
-// sanitizeURL removes any userinfo (user:password@) from a URL so URL-embedded
-// credentials are never written to disk. Unparseable input is returned unchanged.
-func sanitizeURL(s string) string {
-	if s == "" {
-		return s
-	}
-	u, err := url.Parse(s)
-	if err != nil {
-		return s
-	}
-	u.User = nil
-	return u.String()
 }
 
 // Load reads the session from disk. It returns (nil, nil) when no session exists.

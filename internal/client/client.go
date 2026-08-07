@@ -16,6 +16,7 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
@@ -43,6 +44,54 @@ const (
 	defaultResponseHeaderTimeout = 30 * time.Second
 )
 
+// maxCardBytes caps the agent-card response body (audit F-3, retires Phase-1
+// I-2). The SDK reads the card with io.ReadAll and applies no size limit, so a
+// hostile or misbehaving server could stream an unbounded body and exhaust
+// memory. 4 MiB is far larger than any legitimate card; an oversized body errors
+// during the fetch and surfaces as the existing unreachable/parse failure.
+const maxCardBytes = 4 << 20 // 4 MiB
+
+// errCardTooLarge is returned when a card body exceeds maxCardBytes.
+var errCardTooLarge = errors.New("agent card response exceeds size limit (4 MiB)")
+
+// limitedRT wraps a RoundTripper and caps every response body at limit bytes so a
+// single fetch cannot exhaust memory (audit F-3). It is installed only on the
+// card-fetch client, not on the send/get data-plane transport.
+type limitedRT struct {
+	base  http.RoundTripper
+	limit int64
+}
+
+func (l limitedRT) RoundTrip(req *http.Request) (*http.Response, error) {
+	resp, err := l.base.RoundTrip(req)
+	if err != nil {
+		return resp, err
+	}
+	resp.Body = &limitedBody{r: resp.Body, remaining: l.limit}
+	return resp, nil
+}
+
+// limitedBody caps the number of bytes readable from a response body. Once the
+// cap is exceeded it returns errCardTooLarge instead of more data.
+type limitedBody struct {
+	r         io.ReadCloser
+	remaining int64
+}
+
+func (b *limitedBody) Read(p []byte) (int, error) {
+	if b.remaining < 0 {
+		return 0, errCardTooLarge
+	}
+	n, err := b.r.Read(p)
+	b.remaining -= int64(n)
+	if b.remaining < 0 {
+		return n, errCardTooLarge
+	}
+	return n, err
+}
+
+func (b *limitedBody) Close() error { return b.r.Close() }
+
 // Options configures a Client.
 type Options struct {
 	ServiceURL string             // base URL of the agent
@@ -61,6 +110,8 @@ type Client struct {
 	card      *a2a.AgentCard
 	transport string
 	url       string
+	routingID string
+	reason    string
 	version   string
 	timeout   time.Duration
 }
@@ -95,6 +146,12 @@ func New(ctx context.Context, opts Options) (*Client, error) {
 		Timeout:   defaultHTTPTimeout,
 		Transport: transport,
 	}
+	// The card-fetch client wraps the same transport with a body-size cap (audit
+	// F-3): only the card fetch is bounded, not the data-plane send/get responses.
+	cardHTTPClient := &http.Client{
+		Timeout:   defaultHTTPTimeout,
+		Transport: limitedRT{base: transport, limit: maxCardBytes},
+	}
 
 	// When --timeout is set, bound the card-fetch/connect phase on the context too.
 	if opts.Timeout > 0 {
@@ -103,15 +160,24 @@ func New(ctx context.Context, opts Options) (*Client, error) {
 		defer cancel()
 	}
 
-	card, err := resolveCard(ctx, opts, version, httpClient)
+	card, err := resolveCard(ctx, opts, version, cardHTTPClient)
 	if err != nil {
 		return nil, clierr.Wrap(clierr.KindUnreachable, "failed to fetch agent card: "+err.Error(), err)
 	}
 
-	iface, transportName, err := selectInterface(card, opts.Transport, opts.ServiceURL)
+	// The card was fetched from --card-url when set, else --service-url; that origin
+	// anchors the downgrade/cross-origin checks inside selectInterface (B2).
+	fetchURL := opts.ServiceURL
+	if opts.CardURL != "" {
+		fetchURL = opts.CardURL
+	}
+	sel, err := selectInterface(card, opts.Transport, opts.ServiceURL, fetchURL, opts.Insecure, opts.warnf)
 	if err != nil {
 		return nil, err
 	}
+	iface := sel.iface
+	transportName := sel.transport
+	reason := sel.reason
 	// Signal the requested/default protocol version by pinning the selected
 	// interface's version; the SDK sets the A2A-Version header from it on every
 	// request (spec §11.2). This guarantees a non-empty value.
@@ -141,6 +207,8 @@ func New(ctx context.Context, opts Options) (*Client, error) {
 		card:      card,
 		transport: transportName,
 		url:       iface.URL,
+		routingID: iface.Tenant,
+		reason:    reason,
 		version:   version,
 		timeout:   opts.Timeout,
 	}, nil
@@ -191,6 +259,33 @@ func (c *Client) URL() string { return c.url }
 // Card returns the normalized agent card.
 func (c *Client) Card() *envelope.Card {
 	return envelope.FromCard(c.card, c.transport, c.url)
+}
+
+// FullCard returns the complete normalized agent card for `discover`, with the
+// transport selection (chosen binding/URL, reason, routing id) attached
+// (design §8.1/§11.1).
+func (c *Client) FullCard() *envelope.FullCard {
+	return envelope.FromFullCard(c.card, envelope.CardSelection{
+		Transport: c.transport,
+		URL:       c.url,
+		Reason:    c.reason,
+		RoutingID: c.routingID,
+	})
+}
+
+// ValidateCard validates the resolved card against the A2A card schema
+// (design §8.1 --validate). A malformed/invalid card is returned as a generic
+// error (non-zero exit) whose message lists every problem found.
+func (c *Client) ValidateCard() error {
+	problems := envelope.ValidateCard(c.card)
+	if len(problems) == 0 {
+		return nil
+	}
+	msg := "agent card failed validation:"
+	for _, p := range problems {
+		msg += "\n  - " + p
+	}
+	return clierr.New(clierr.KindGeneric, msg)
 }
 
 // SendRequest is the input to Send.

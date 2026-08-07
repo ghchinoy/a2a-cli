@@ -15,6 +15,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"strings"
+	"unicode/utf8"
 
 	"github.com/ghchinoy/a2a-cli/internal/envelope"
 )
@@ -27,23 +29,52 @@ const (
 	ModeJSON Mode = "json"
 )
 
-// Renderer serializes envelope types. Out is the machine/primary stream (stdout);
-// Err is the diagnostics stream (stderr). In json mode nothing but JSON is ever
-// written to Out.
+// Renderer serializes envelope types. The stdout/stderr writers are private on
+// purpose: render is the ONLY component that writes program output (design §3.8),
+// and every text write goes through the emit chokepoint so untrusted
+// (server/card-derived) content is sanitized by construction. The single
+// exception is writeJSON, which emits the -o json envelope to RAW stdout. Nothing
+// outside this package can reach the streams, so a new print seam cannot bypass
+// sanitization.
 type Renderer struct {
 	Mode Mode
-	Out  io.Writer
-	Err  io.Writer
+	out  io.Writer // primary/stdout — raw only via writeJSON; else via emit
+	err  io.Writer // diagnostics/stderr — always via emit
 }
 
 // New builds a Renderer for the given mode and streams.
 func New(mode Mode, out, err io.Writer) *Renderer {
-	return &Renderer{Mode: mode, Out: out, Err: err}
+	return &Renderer{Mode: mode, out: out, err: err}
 }
 
-// Warn writes a diagnostic to stderr only (never pollutes json stdout).
+// emit is the single text-output chokepoint (design §3.8: render is the only
+// writer). `format` is a TRUSTED constant authored by the CLI; every string or
+// error arg is treated as UNTRUSTED (server/card-derived) and passed through
+// `clean` before interpolation, so a value's embedded ESC/CR/control bytes can
+// never reach the terminal while the template's own newlines survive. Non-string
+// args (bool, int) pass through untouched.
+//
+// INVARIANT — do NOT add another `fmt.Fprint*` to r.out/r.err anywhere in this
+// package. Route text through emit so sanitization holds by construction; the
+// ONLY sanctioned raw writer is writeJSON (the -o json stdout envelope, which
+// encoding/json already single-escapes — re-sanitizing would corrupt it).
+func (r *Renderer) emit(w io.Writer, clean func(string) string, format string, args ...any) {
+	for i, a := range args {
+		switch v := a.(type) {
+		case string:
+			args[i] = clean(v)
+		case error:
+			args[i] = clean(v.Error())
+		}
+	}
+	fmt.Fprintf(w, format, args...)
+}
+
+// Warn writes a diagnostic to stderr only (never pollutes json stdout). Warnings
+// are single-line, so untrusted args are escaped with sanitizeTerminal (an
+// embedded newline/CR in a value is a fake-line primitive and must not survive).
 func (r *Renderer) Warn(format string, args ...any) {
-	fmt.Fprintf(r.Err, format+"\n", args...)
+	r.emit(r.err, sanitizeTerminal, format+"\n", args...)
 }
 
 // RenderTask writes a TaskResult. In json mode it emits the Appendix B envelope
@@ -51,19 +82,23 @@ func (r *Renderer) Warn(format string, args ...any) {
 // when a taskId exists, a copy-pasteable resume command (spec §6.3).
 func (r *Renderer) RenderTask(tr *envelope.TaskResult) error {
 	if r.Mode == ModeJSON {
-		return writeJSON(r.Out, tr)
+		return writeJSON(r.out, tr)
 	}
 	return r.renderTaskText(tr)
 }
 
+// renderTaskText prints a TaskResult for a TTY. State/TaskID/Context/Message/
+// Artifact text are all server-derived, so every value is routed through the emit
+// chokepoint (sanitizeTerminal); only the CLI-authored labels and the '\n' in the
+// Resume template are trusted.
 func (r *Renderer) renderTaskText(tr *envelope.TaskResult) error {
-	w := r.Out
-	fmt.Fprintf(w, "State:     %s\n", nonEmpty(tr.State))
-	fmt.Fprintf(w, "Task ID:   %s\n", ptr(tr.TaskID))
-	fmt.Fprintf(w, "Context:   %s\n", ptr(tr.ContextID))
+	w := r.out
+	r.emit(w, sanitizeTerminal, "State:     %s\n", nonEmpty(tr.State))
+	r.emit(w, sanitizeTerminal, "Task ID:   %s\n", ptr(tr.TaskID))
+	r.emit(w, sanitizeTerminal, "Context:   %s\n", ptr(tr.ContextID))
 	if tr.Message != nil {
 		if text := joinParts(tr.Message.Parts); text != "" {
-			fmt.Fprintf(w, "Message:   %s\n", text)
+			r.emit(w, sanitizeTerminal, "Message:   %s\n", text)
 		}
 	}
 	for _, a := range tr.Artifacts {
@@ -72,11 +107,111 @@ func (r *Renderer) renderTaskText(tr *envelope.TaskResult) error {
 			label = a.ArtifactID
 		}
 		if text := joinParts(a.Parts); text != "" {
-			fmt.Fprintf(w, "Artifact %s: %s\n", label, text)
+			r.emit(w, sanitizeTerminal, "Artifact %s: %s\n", label, text)
 		}
 	}
 	if tr.TaskID != nil {
-		fmt.Fprintf(w, "\nResume:    a2a-cli send --task-id %s \"<reply>\"\n", *tr.TaskID)
+		r.emit(w, sanitizeTerminal, "\nResume:    a2a-cli send --task-id %s \"<reply>\"\n", *tr.TaskID)
+	}
+	return nil
+}
+
+// RenderCard writes a FullCard (design §8.1). In json mode it emits only the
+// normalized FullCard to stdout; in text mode it prints every card section with
+// copy-pasteable identifiers and shows which transport the client would select.
+func (r *Renderer) RenderCard(c *envelope.FullCard) error {
+	if c == nil {
+		return nil
+	}
+	if r.Mode == ModeJSON {
+		return writeJSON(r.out, c)
+	}
+	return r.renderCardText(c)
+}
+
+// renderCardText prints a FullCard for a TTY. EVERY card-derived value reaches the
+// terminal through the emit chokepoint, which sanitizes each string arg: an agent
+// card is untrusted input (discover's whole purpose is inspecting an agent before
+// trusting it), so control/escape bytes must never reach the terminal (audit F-1).
+// Structural labels in the trusted format templates and boolean capabilities are
+// tool-controlled and pass through as-is.
+func (r *Renderer) renderCardText(c *envelope.FullCard) error {
+	w := r.out
+	r.emit(w, sanitizeTerminal, "Name:        %s\n", nonEmpty(c.Name))
+	if c.Description != "" {
+		r.emit(w, sanitizeTerminal, "Description: %s\n", c.Description)
+	}
+	if c.Version != "" {
+		r.emit(w, sanitizeTerminal, "Version:     %s\n", c.Version)
+	}
+	if c.Provider != nil && (c.Provider.Organization != "" || c.Provider.URL != "") {
+		r.emit(w, sanitizeTerminal, "Provider:    %s\n", joinNonEmpty(" — ", c.Provider.Organization, c.Provider.URL))
+	}
+	if c.DocumentationURL != "" {
+		r.emit(w, sanitizeTerminal, "Docs:        %s\n", c.DocumentationURL)
+	}
+
+	r.emit(w, sanitizeTerminal, "\nCapabilities:\n")
+	r.emit(w, sanitizeTerminal, "  streaming:         %t\n", c.Capabilities.Streaming)
+	r.emit(w, sanitizeTerminal, "  pushNotifications: %t\n", c.Capabilities.PushNotifications)
+	r.emit(w, sanitizeTerminal, "  extendedAgentCard: %t\n", c.Capabilities.ExtendedAgentCard)
+	for _, ext := range c.Capabilities.Extensions {
+		req := ""
+		if ext.Required {
+			req = " (required)"
+		}
+		r.emit(w, sanitizeTerminal, "  extension: %s%s\n", ext.URI, req)
+	}
+
+	r.emit(w, sanitizeTerminal, "\nInterfaces:\n")
+	if len(c.Interfaces) == 0 {
+		r.emit(w, sanitizeTerminal, "  (none declared)\n")
+	}
+	for _, iface := range c.Interfaces {
+		r.emit(w, sanitizeTerminal, "  - %-8s %s", iface.Transport, iface.URL)
+		if iface.ProtocolVersion != "" {
+			r.emit(w, sanitizeTerminal, " [v%s]", iface.ProtocolVersion)
+		}
+		if iface.RoutingID != "" {
+			r.emit(w, sanitizeTerminal, " routingId=%s", iface.RoutingID)
+		}
+		r.emit(w, sanitizeTerminal, "\n")
+	}
+
+	r.emit(w, sanitizeTerminal, "\nSecurity schemes:\n")
+	if len(c.SecuritySchemes) == 0 {
+		r.emit(w, sanitizeTerminal, "  (none — no authentication required)\n")
+	}
+	for _, s := range c.SecuritySchemes {
+		r.emit(w, sanitizeTerminal, "  - %s: %s", s.Name, s.Type)
+		if s.Detail != "" {
+			r.emit(w, sanitizeTerminal, " (%s)", s.Detail)
+		}
+		r.emit(w, sanitizeTerminal, "\n")
+	}
+
+	r.emit(w, sanitizeTerminal, "\nSkills:\n")
+	if len(c.Skills) == 0 {
+		r.emit(w, sanitizeTerminal, "  (none declared)\n")
+	}
+	for _, sk := range c.Skills {
+		r.emit(w, sanitizeTerminal, "  - %s", nonEmpty(sk.ID))
+		if sk.Name != "" {
+			r.emit(w, sanitizeTerminal, " (%s)", sk.Name)
+		}
+		r.emit(w, sanitizeTerminal, "\n")
+		if sk.Description != "" {
+			r.emit(w, sanitizeTerminal, "      %s\n", sk.Description)
+		}
+		if len(sk.Tags) > 0 {
+			r.emit(w, sanitizeTerminal, "      tags: %s\n", strings.Join(sk.Tags, ", "))
+		}
+	}
+
+	r.emit(w, sanitizeTerminal, "\nSelected transport: %s -> %s\n", nonEmpty(c.Selection.Transport), nonEmpty(c.Selection.URL))
+	r.emit(w, sanitizeTerminal, "  reason: %s\n", c.Selection.Reason)
+	if c.Selection.RoutingID != "" {
+		r.emit(w, sanitizeTerminal, "  routing identifier: %s\n", c.Selection.RoutingID)
 	}
 	return nil
 }
@@ -85,9 +220,16 @@ func (r *Renderer) renderTaskText(tr *envelope.TaskResult) error {
 // goes to stdout (still valid JSON); in text mode a human message goes to stderr.
 func (r *Renderer) RenderError(ce envelope.CLIError) error {
 	if r.Mode == ModeJSON {
-		return writeJSON(r.Out, ce)
+		// encoding/json already escapes control bytes; the stdout envelope must
+		// stay single-escaped, so do NOT run the terminal sanitizer over it.
+		return writeJSON(r.out, ce)
 	}
-	fmt.Fprintf(r.Err, "Error [%s]: %s\n", ce.Code, ce.Message)
+	// Text diagnostic goes to a TTY: an error Message can embed card-derived,
+	// attacker-controlled content (e.g. B2's rejected interface URL), so it routes
+	// through the emit chokepoint with sanitizeDiagnostic (audit N-1 / review C-1).
+	// sanitizeDiagnostic is per-line, so a CLI-authored multi-line Message keeps its
+	// own '\n' while ESC/CR inside any line is escaped.
+	r.emit(r.err, sanitizeDiagnostic, "Error [%s]: %s\n", ce.Code, ce.Message)
 	return nil
 }
 
@@ -127,9 +269,97 @@ func ptr(s *string) string {
 	return *s
 }
 
+// joinNonEmpty joins the non-empty arguments with sep.
+func joinNonEmpty(sep string, parts ...string) string {
+	var kept []string
+	for _, p := range parts {
+		if p != "" {
+			kept = append(kept, p)
+		}
+	}
+	return strings.Join(kept, sep)
+}
+
 func nonEmpty(s string) string {
 	if s == "" {
 		return "(unknown)"
 	}
 	return s
+}
+
+// sanitizeTerminal makes an untrusted string safe to print to a terminal by
+// escaping bytes that a hostile agent card could use to drive the TTY: C0 control
+// characters (incl. ESC 0x1b and CR 0x0d), DEL (0x7f), and the C1 range
+// (0x80–0x9f, which some terminals treat as control introducers). Tab (0x09) is
+// preserved as-is; everything else — including all printable multi-byte UTF-8 —
+// passes through unchanged. Offending runes are rendered as \xNN so the operator
+// still sees that a byte was there without letting it execute (audit F-1).
+//
+// This is the render-seam sanitizer: any command whose renderer prints
+// server-derived strings in text mode should route them through here so terminal
+// safety is enforced in one place rather than per-command.
+func sanitizeTerminal(s string) string {
+	// Fast path: most strings are clean, so avoid allocating a builder.
+	if !needsSanitize(s) {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s) + 8)
+	for i := 0; i < len(s); {
+		r, size := utf8.DecodeRuneInString(s[i:])
+		if r == utf8.RuneError && size == 1 {
+			// Invalid UTF-8 byte: escape the raw byte so it can never reach
+			// the terminal (and never gets re-interpreted downstream).
+			fmt.Fprintf(&b, "\\x%02x", s[i])
+			i++
+			continue
+		}
+		if isSafeRune(r) {
+			b.WriteRune(r)
+		} else {
+			fmt.Fprintf(&b, "\\x%02x", r)
+		}
+		i += size
+	}
+	return b.String()
+}
+
+// sanitizeDiagnostic makes an untrusted diagnostic string (an error message or a
+// warning that may embed card/server-derived content) safe for a terminal while
+// preserving the CLI's own line structure. It splits on '\n' — the line
+// separator the CLI itself authors in multi-line diagnostics (e.g. the
+// --validate problem list) — and runs sanitizeTerminal over each line, so ESC,
+// CR, and other control bytes inside any line are escaped but CLI-authored line
+// breaks survive. This is the diagnostic-seam counterpart to the success-render
+// seam; every command that reports errors/warnings inherits it centrally.
+func sanitizeDiagnostic(s string) string {
+	if !strings.Contains(s, "\n") {
+		return sanitizeTerminal(s)
+	}
+	lines := strings.Split(s, "\n")
+	for i, line := range lines {
+		lines[i] = sanitizeTerminal(line)
+	}
+	return strings.Join(lines, "\n")
+}
+
+// isSafeRune reports whether r may be printed to a terminal unescaped: tab and
+// any rune that is not a C0/C1 control or DEL.
+func isSafeRune(r rune) bool {
+	return r == '\t' || (r >= 0x20 && r != 0x7f && !(r >= 0x80 && r <= 0x9f))
+}
+
+// needsSanitize reports whether s contains any byte sanitizeTerminal would escape.
+func needsSanitize(s string) bool {
+	for i := 0; i < len(s); {
+		r, size := utf8.DecodeRuneInString(s[i:])
+		if r == utf8.RuneError && size == 1 {
+			return true
+		}
+		if !isSafeRune(r) {
+			return true
+		}
+		i += size
+	}
+	return false
 }
