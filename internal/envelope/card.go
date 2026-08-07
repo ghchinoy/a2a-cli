@@ -12,6 +12,8 @@ import (
 	"fmt"
 
 	"github.com/a2aproject/a2a-go/v2/a2a"
+
+	"github.com/ghchinoy/a2a-cli/internal/urlutil"
 )
 
 // Card is a normalized, minimal Agent Card view used by the Phase-1 send path:
@@ -137,6 +139,11 @@ func FromFullCard(c *a2a.AgentCard, sel CardSelection) *FullCard {
 	if c == nil {
 		return nil
 	}
+	// Strip any user:pass@ credential embedded in URLs before presenting them
+	// (audit F-4). Phase-1 stripped userinfo on persistence; this closes the
+	// presentation path so `discover` never echoes a credential a hostile or
+	// careless card/URL carries.
+	sel.URL = urlutil.Sanitize(sel.URL)
 	out := &FullCard{
 		Name:               c.Name,
 		Description:        c.Description,
@@ -168,7 +175,7 @@ func FromFullCard(c *a2a.AgentCard, sel CardSelection) *FullCard {
 		}
 		out.Interfaces = append(out.Interfaces, CardInterface{
 			Transport:       string(iface.ProtocolBinding),
-			URL:             iface.URL,
+			URL:             urlutil.Sanitize(iface.URL),
 			ProtocolVersion: string(iface.ProtocolVersion),
 			RoutingID:       iface.Tenant,
 		})

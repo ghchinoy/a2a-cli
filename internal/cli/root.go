@@ -160,7 +160,7 @@ func validateOutputFlag(flags *pflag.FlagSet) error {
 	if err != nil || validOutputValues[strings.ToLower(o)] {
 		return nil
 	}
-	e := clierr.New(clierr.KindUsage, fmt.Sprintf("invalid --output value %q (want text|json)", o))
+	e := clierr.New(clierr.KindUsage, fmt.Sprintf("invalid --output value %q (want one of: text, json, tui)", o))
 	r := render.New(render.ModeText, os.Stdout, os.Stderr)
 	_ = r.RenderError(e.ToEnvelope())
 	e.MarkRendered()

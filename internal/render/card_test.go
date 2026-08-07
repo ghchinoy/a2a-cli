@@ -62,6 +62,103 @@ func TestRenderCard_JSON_OnlyValidJSONOnStdout(t *testing.T) {
 	}
 }
 
+func TestRenderCard_JSON_PresentsAllSections(t *testing.T) {
+	// R-c: the json envelope must carry every section, not just name/skills.
+	var out, errb bytes.Buffer
+	r := New(ModeJSON, &out, &errb)
+	if err := r.RenderCard(sampleFullCard()); err != nil {
+		t.Fatal(err)
+	}
+	got := out.String()
+	for _, want := range []string{
+		`"provider"`,
+		`"organization": "Acme"`,
+		`"capabilities"`,
+		`"streaming": true`,
+		`"extensions"`,
+		`"uri": "urn:ext:foo"`,
+		`"interfaces"`,
+		`"transport": "HTTP+JSON"`,
+		`"securitySchemes"`,
+		`"name": "apiKeyScheme"`,
+		`"skills"`,
+		`"selection"`,
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("json output missing %q\n---\n%s", want, got)
+		}
+	}
+}
+
+// TestSanitizeTerminal_EscapesControlBytes is the unit-level guard for the B1
+// render-seam sanitizer: it must escape ESC/CR/other control + C1 + DEL while
+// preserving tab and printable UTF-8.
+func TestSanitizeTerminal_EscapesControlBytes(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"plain", "hello world", "hello world"},
+		{"utf8", "café — 日本語", "café — 日本語"},
+		{"tab-kept", "a\tb", "a\tb"},
+		{"esc", "a\x1b[31mred", `a\x1b[31mred`},
+		{"cr", "line1\rline2", `line1\x0dline2`},
+		{"lf", "line1\nline2", `line1\x0aline2`},
+		{"del", "a\x7fb", `a\x7fb`},
+		{"c1", "a\x9bb", `a\x9bb`},
+		{"nul", "a\x00b", `a\x00b`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := sanitizeTerminal(tc.in); got != tc.want {
+				t.Errorf("sanitizeTerminal(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestRenderCard_Text_SanitizesHostileCard is the B1 regression test: a card
+// whose fields carry ANSI escapes and carriage returns must render with NO raw
+// control bytes surviving into text-mode stdout.
+func TestRenderCard_Text_SanitizesHostileCard(t *testing.T) {
+	hostile := "\x1b[2K\rSelected transport: evil -> http://attacker\x1b[0m"
+	c := &envelope.FullCard{
+		Name:        "Agent\x1b[31m",
+		Description: hostile,
+		Version:     "1.0\r\n",
+		Provider:    &envelope.CardProvider{Organization: "Org\x1b[1m", URL: "http://x\x07"},
+		Capabilities: envelope.CardCapabilities{
+			Extensions: []envelope.CardExtension{{URI: "urn:\x1bevil"}},
+		},
+		Interfaces: []envelope.CardInterface{
+			{Transport: "HTTP\x1b+JSON", URL: "http://h\rx", ProtocolVersion: "1\x1b", RoutingID: "t\x1b7"},
+		},
+		SecuritySchemes: []envelope.CardSecurity{
+			{Name: "s\x1bk", Type: "apiKey\r", Detail: "d\x1be"},
+		},
+		Skills: []envelope.CardSkill{
+			{ID: "id\x1b", Name: "n\r", Description: "de\x1bsc", Tags: []string{"t\x1ba", "t\rb"}},
+		},
+		Selection: envelope.CardSelection{Transport: "http-json\x1b", URL: "http://h\r", Reason: hostile, RoutingID: "r\x1b"},
+	}
+	var out, errb bytes.Buffer
+	r := New(ModeText, &out, &errb)
+	if err := r.RenderCard(c); err != nil {
+		t.Fatal(err)
+	}
+	got := out.String()
+	for _, b := range []byte{0x1b, 0x0d, 0x07, 0x00} {
+		if bytes.IndexByte([]byte(got), b) >= 0 {
+			t.Errorf("hostile card text output contains raw control byte 0x%02x\n---\n%q", b, got)
+		}
+	}
+	// The escaped form must be present so the operator still sees the bytes.
+	if !strings.Contains(got, `\x1b`) {
+		t.Errorf("expected escaped ESC in output, got:\n%q", got)
+	}
+}
+
 func TestRenderCard_Text_PresentsAllSections(t *testing.T) {
 	var out, errb bytes.Buffer
 	r := New(ModeText, &out, &errb)

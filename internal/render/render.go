@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/ghchinoy/a2a-cli/internal/envelope"
 )
@@ -95,20 +96,25 @@ func (r *Renderer) RenderCard(c *envelope.FullCard) error {
 	return r.renderCardText(c)
 }
 
+// renderCardText prints a FullCard for a TTY. EVERY card-derived string is passed
+// through sanitizeTerminal first: an agent card is untrusted input (discover's
+// whole purpose is inspecting an agent before trusting it), so control/escape
+// bytes must never reach the terminal (audit F-1). Structural labels and boolean
+// capabilities are tool-controlled and printed as-is.
 func (r *Renderer) renderCardText(c *envelope.FullCard) error {
 	w := r.Out
-	fmt.Fprintf(w, "Name:        %s\n", nonEmpty(c.Name))
+	fmt.Fprintf(w, "Name:        %s\n", sanitizeTerminal(nonEmpty(c.Name)))
 	if c.Description != "" {
-		fmt.Fprintf(w, "Description: %s\n", c.Description)
+		fmt.Fprintf(w, "Description: %s\n", sanitizeTerminal(c.Description))
 	}
 	if c.Version != "" {
-		fmt.Fprintf(w, "Version:     %s\n", c.Version)
+		fmt.Fprintf(w, "Version:     %s\n", sanitizeTerminal(c.Version))
 	}
 	if c.Provider != nil && (c.Provider.Organization != "" || c.Provider.URL != "") {
-		fmt.Fprintf(w, "Provider:    %s\n", joinNonEmpty(" — ", c.Provider.Organization, c.Provider.URL))
+		fmt.Fprintf(w, "Provider:    %s\n", joinNonEmpty(" — ", sanitizeTerminal(c.Provider.Organization), sanitizeTerminal(c.Provider.URL)))
 	}
 	if c.DocumentationURL != "" {
-		fmt.Fprintf(w, "Docs:        %s\n", c.DocumentationURL)
+		fmt.Fprintf(w, "Docs:        %s\n", sanitizeTerminal(c.DocumentationURL))
 	}
 
 	fmt.Fprintf(w, "\nCapabilities:\n")
@@ -120,7 +126,7 @@ func (r *Renderer) renderCardText(c *envelope.FullCard) error {
 		if ext.Required {
 			req = " (required)"
 		}
-		fmt.Fprintf(w, "  extension: %s%s\n", ext.URI, req)
+		fmt.Fprintf(w, "  extension: %s%s\n", sanitizeTerminal(ext.URI), req)
 	}
 
 	fmt.Fprintf(w, "\nInterfaces:\n")
@@ -128,12 +134,12 @@ func (r *Renderer) renderCardText(c *envelope.FullCard) error {
 		fmt.Fprintf(w, "  (none declared)\n")
 	}
 	for _, iface := range c.Interfaces {
-		fmt.Fprintf(w, "  - %-8s %s", iface.Transport, iface.URL)
+		fmt.Fprintf(w, "  - %-8s %s", sanitizeTerminal(iface.Transport), sanitizeTerminal(iface.URL))
 		if iface.ProtocolVersion != "" {
-			fmt.Fprintf(w, " [v%s]", iface.ProtocolVersion)
+			fmt.Fprintf(w, " [v%s]", sanitizeTerminal(iface.ProtocolVersion))
 		}
 		if iface.RoutingID != "" {
-			fmt.Fprintf(w, " routingId=%s", iface.RoutingID)
+			fmt.Fprintf(w, " routingId=%s", sanitizeTerminal(iface.RoutingID))
 		}
 		fmt.Fprintf(w, "\n")
 	}
@@ -143,9 +149,9 @@ func (r *Renderer) renderCardText(c *envelope.FullCard) error {
 		fmt.Fprintf(w, "  (none — no authentication required)\n")
 	}
 	for _, s := range c.SecuritySchemes {
-		fmt.Fprintf(w, "  - %s: %s", s.Name, s.Type)
+		fmt.Fprintf(w, "  - %s: %s", sanitizeTerminal(s.Name), sanitizeTerminal(s.Type))
 		if s.Detail != "" {
-			fmt.Fprintf(w, " (%s)", s.Detail)
+			fmt.Fprintf(w, " (%s)", sanitizeTerminal(s.Detail))
 		}
 		fmt.Fprintf(w, "\n")
 	}
@@ -155,23 +161,23 @@ func (r *Renderer) renderCardText(c *envelope.FullCard) error {
 		fmt.Fprintf(w, "  (none declared)\n")
 	}
 	for _, sk := range c.Skills {
-		fmt.Fprintf(w, "  - %s", nonEmpty(sk.ID))
+		fmt.Fprintf(w, "  - %s", sanitizeTerminal(nonEmpty(sk.ID)))
 		if sk.Name != "" {
-			fmt.Fprintf(w, " (%s)", sk.Name)
+			fmt.Fprintf(w, " (%s)", sanitizeTerminal(sk.Name))
 		}
 		fmt.Fprintf(w, "\n")
 		if sk.Description != "" {
-			fmt.Fprintf(w, "      %s\n", sk.Description)
+			fmt.Fprintf(w, "      %s\n", sanitizeTerminal(sk.Description))
 		}
 		if len(sk.Tags) > 0 {
-			fmt.Fprintf(w, "      tags: %s\n", strings.Join(sk.Tags, ", "))
+			fmt.Fprintf(w, "      tags: %s\n", sanitizeTerminal(strings.Join(sk.Tags, ", ")))
 		}
 	}
 
-	fmt.Fprintf(w, "\nSelected transport: %s -> %s\n", nonEmpty(c.Selection.Transport), nonEmpty(c.Selection.URL))
-	fmt.Fprintf(w, "  reason: %s\n", c.Selection.Reason)
+	fmt.Fprintf(w, "\nSelected transport: %s -> %s\n", sanitizeTerminal(nonEmpty(c.Selection.Transport)), sanitizeTerminal(nonEmpty(c.Selection.URL)))
+	fmt.Fprintf(w, "  reason: %s\n", sanitizeTerminal(c.Selection.Reason))
 	if c.Selection.RoutingID != "" {
-		fmt.Fprintf(w, "  routing identifier: %s\n", c.Selection.RoutingID)
+		fmt.Fprintf(w, "  routing identifier: %s\n", sanitizeTerminal(c.Selection.RoutingID))
 	}
 	return nil
 }
@@ -238,4 +244,62 @@ func nonEmpty(s string) string {
 		return "(unknown)"
 	}
 	return s
+}
+
+// sanitizeTerminal makes an untrusted string safe to print to a terminal by
+// escaping bytes that a hostile agent card could use to drive the TTY: C0 control
+// characters (incl. ESC 0x1b and CR 0x0d), DEL (0x7f), and the C1 range
+// (0x80–0x9f, which some terminals treat as control introducers). Tab (0x09) is
+// preserved as-is; everything else — including all printable multi-byte UTF-8 —
+// passes through unchanged. Offending runes are rendered as \xNN so the operator
+// still sees that a byte was there without letting it execute (audit F-1).
+//
+// This is the render-seam sanitizer: any command whose renderer prints
+// server-derived strings in text mode should route them through here so terminal
+// safety is enforced in one place rather than per-command.
+func sanitizeTerminal(s string) string {
+	// Fast path: most strings are clean, so avoid allocating a builder.
+	if !needsSanitize(s) {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s) + 8)
+	for i := 0; i < len(s); {
+		r, size := utf8.DecodeRuneInString(s[i:])
+		if r == utf8.RuneError && size == 1 {
+			// Invalid UTF-8 byte: escape the raw byte so it can never reach
+			// the terminal (and never gets re-interpreted downstream).
+			fmt.Fprintf(&b, "\\x%02x", s[i])
+			i++
+			continue
+		}
+		if isSafeRune(r) {
+			b.WriteRune(r)
+		} else {
+			fmt.Fprintf(&b, "\\x%02x", r)
+		}
+		i += size
+	}
+	return b.String()
+}
+
+// isSafeRune reports whether r may be printed to a terminal unescaped: tab and
+// any rune that is not a C0/C1 control or DEL.
+func isSafeRune(r rune) bool {
+	return r == '\t' || (r >= 0x20 && r != 0x7f && !(r >= 0x80 && r <= 0x9f))
+}
+
+// needsSanitize reports whether s contains any byte sanitizeTerminal would escape.
+func needsSanitize(s string) bool {
+	for i := 0; i < len(s); {
+		r, size := utf8.DecodeRuneInString(s[i:])
+		if r == utf8.RuneError && size == 1 {
+			return true
+		}
+		if !isSafeRune(r) {
+			return true
+		}
+		i += size
+	}
+	return false
 }

@@ -37,6 +37,11 @@ func TestInvalidOutputValue_IsUsageError(t *testing.T) {
 			if !strings.Contains(errOut, "USAGE") || !strings.Contains(errOut, "output") {
 				t.Errorf("expected a USAGE output diagnostic on stderr, got %q", errOut)
 			}
+			// R-e: the diagnostic must name the full accepted set (tui included),
+			// not just text|json.
+			if !strings.Contains(errOut, "text") || !strings.Contains(errOut, "json") || !strings.Contains(errOut, "tui") {
+				t.Errorf("diagnostic should list the accepted values text/json/tui, got %q", errOut)
+			}
 		})
 	}
 }

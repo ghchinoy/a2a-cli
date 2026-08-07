@@ -42,7 +42,10 @@ func newDiscoverCommand() *cobra.Command {
 		},
 		RunE: runDiscover,
 	}
-	cmd.Flags().Bool(flagValidate, false, "validate the card against the A2A card schema (non-zero exit if invalid)")
+	// F-5 (accepted for Tier 1): --validate is a STRUCTURAL conformance aid
+	// (required fields / shape), NOT a full JSON-Schema validation and NOT a
+	// security check — it does not vet URLs, credentials, or trust.
+	cmd.Flags().Bool(flagValidate, false, "check the card's required-field structure (a conformance aid, not a security check; non-zero exit if invalid)")
 	return cmd
 }
 

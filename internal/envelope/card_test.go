@@ -131,6 +131,76 @@ func TestValidateCard_Nil(t *testing.T) {
 	}
 }
 
+// TestValidateCard_InterfaceAndSkillBranches exercises the per-interface and
+// per-skill validation branches individually (coverage R-d).
+func TestValidateCard_InterfaceAndSkillBranches(t *testing.T) {
+	base := func() *a2a.AgentCard {
+		return &a2a.AgentCard{
+			Name:                "A",
+			Description:         "d",
+			SupportedInterfaces: []*a2a.AgentInterface{a2a.NewAgentInterface("http://h", a2a.TransportProtocolHTTPJSON)},
+		}
+	}
+	cases := []struct {
+		name    string
+		mutate  func(c *a2a.AgentCard)
+		wantSub string
+	}{
+		{
+			name:    "nil interface",
+			mutate:  func(c *a2a.AgentCard) { c.SupportedInterfaces = []*a2a.AgentInterface{nil} },
+			wantSub: "is null",
+		},
+		{
+			name: "interface missing url",
+			mutate: func(c *a2a.AgentCard) {
+				c.SupportedInterfaces = []*a2a.AgentInterface{{ProtocolBinding: a2a.TransportProtocolHTTPJSON}}
+			},
+			wantSub: "missing url",
+		},
+		{
+			name:    "interface missing protocolBinding",
+			mutate:  func(c *a2a.AgentCard) { c.SupportedInterfaces = []*a2a.AgentInterface{{URL: "http://h"}} },
+			wantSub: "missing protocolBinding",
+		},
+		{
+			name:    "skill missing name",
+			mutate:  func(c *a2a.AgentCard) { c.Skills = []a2a.AgentSkill{{ID: "s1"}} },
+			wantSub: "missing required field name",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := base()
+			tc.mutate(c)
+			problems := ValidateCard(c)
+			joined := ""
+			for _, p := range problems {
+				joined += p + "\n"
+			}
+			if !contains(joined, tc.wantSub) {
+				t.Errorf("expected a problem mentioning %q; got:\n%s", tc.wantSub, joined)
+			}
+		})
+	}
+}
+
+// TestFromFullCard_StripsUserinfo is the R-b regression: URL-embedded credentials
+// must never survive into the presented FullCard (selection URL or interface URL).
+func TestFromFullCard_StripsUserinfo(t *testing.T) {
+	c := &a2a.AgentCard{
+		Name:                "A",
+		SupportedInterfaces: []*a2a.AgentInterface{a2a.NewAgentInterface("https://user:secret@host/rest", a2a.TransportProtocolHTTPJSON)},
+	}
+	fc := FromFullCard(c, CardSelection{Transport: "http-json", URL: "https://user:secret@host/rest"})
+	if contains(fc.Selection.URL, "secret") || contains(fc.Selection.URL, "user:") {
+		t.Errorf("selection URL leaked credentials: %q", fc.Selection.URL)
+	}
+	if len(fc.Interfaces) != 1 || contains(fc.Interfaces[0].URL, "secret") {
+		t.Errorf("interface URL leaked credentials: %+v", fc.Interfaces)
+	}
+}
+
 func contains(haystack, needle string) bool {
 	for i := 0; i+len(needle) <= len(haystack); i++ {
 		if haystack[i:i+len(needle)] == needle {
