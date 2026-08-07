@@ -32,6 +32,8 @@ const (
 	flagServiceURL   = "service-url"
 	flagContextID    = "context-id"
 	flagTaskID       = "task-id"
+	flagContinue     = "continue"
+	flagLast         = "last"
 	flagOutput       = "output"
 	flagNoTUI        = "no-tui"
 	flagTransport    = "transport"
@@ -94,6 +96,13 @@ func NewRootCommand() *cobra.Command {
 	pf.StringP(flagServiceURL, "u", "", "base URL of the A2A agent")
 	pf.String(flagContextID, "", "context ID to continue a conversation")
 	pf.String(flagTaskID, "", "task ID to send against an existing task")
+	// Resume the stored conversation without re-supplying identifiers (spec §6.4).
+	// --continue resumes the stored contextId (a new task in the same context);
+	// --last additionally resumes the stored latest taskId (send against that task).
+	// Both are opt-in so a bare `send` never silently attaches to a stale task;
+	// explicit --context-id/--task-id override the stored value (§6.4 line 168).
+	pf.Bool(flagContinue, false, "resume the stored conversation (contextId) for the next turn")
+	pf.Bool(flagLast, false, "resume the stored last task (latest taskId) for the next turn")
 	pf.StringP(flagOutput, "o", "text", "output format: text|json")
 	pf.BoolP(flagNoTUI, "n", false, "shorthand for --output json")
 	pf.String(flagTransport, "", "transport binding: http-json|jsonrpc|grpc (default: card-driven, HTTP+JSON)")
@@ -114,6 +123,7 @@ func NewRootCommand() *cobra.Command {
 	root.AddCommand(newSendCommand())
 	root.AddCommand(newGetCommand())
 	root.AddCommand(newCancelCommand())
+	root.AddCommand(newSessionCommand())
 	return root
 }
 
