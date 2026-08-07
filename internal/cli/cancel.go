@@ -90,18 +90,15 @@ func runCancel(cmd *cobra.Command, args []string) error {
 	defer stop()
 
 	cl, err := client.New(ctx, client.Options{
-		ServiceURL: serviceURL,
-		CardURL:    cfg.String(flagCardURL),
-		Transport:  cfg.String(flagTransport),
-		A2AVersion: cfg.String(flagA2AVersion),
-		Insecure:   mustBool(flags, flagInsecure),
-		Timeout:    mustDuration(flags, flagTimeout),
-		Creds: &client.CallerSuppliedProvider{
-			Bearer: cfg.String(flagBearer),
-			APIKey: cfg.String(flagAPIKey),
-			Extra:  headers,
-		},
-		Warnf: r.Warn,
+		ServiceURL:            serviceURL,
+		CardURL:               cfg.String(flagCardURL),
+		Transport:             cfg.String(flagTransport),
+		A2AVersion:            cfg.String(flagA2AVersion),
+		Insecure:              mustBool(flags, flagInsecure),
+		Timeout:               mustDuration(flags, flagTimeout),
+		Creds:                 resolveCredentials(flags, headers),
+		AllowCrossOriginCreds: mustBool(flags, flagAllowXOrigin),
+		Warnf:                 r.Warn,
 	})
 	if err != nil {
 		return renderAndReturn(r, err)

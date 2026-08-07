@@ -33,6 +33,11 @@ const (
 	flagWatch            = "watch"
 )
 
+// maxHistoryLength is the client-side upper bound on --history <n> (R-3 / CO-8):
+// an absurd value is clamped to this sane Tier-1 ceiling (with a stderr warning)
+// rather than forwarded verbatim. Negative is already a usage error above.
+const maxHistoryLength = 1000
+
 func newGetCommand() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "get <taskId>",
@@ -107,7 +112,7 @@ func runGet(cmd *cobra.Command, args []string) error {
 	// nonsensical input, so it is a USAGE error (exit 2) rather than a silent drop —
 	// consistent with the central -o value check (CO-1) and with pflag rejecting an
 	// out-of-range integer at parse time. n == 0 stays valid (forwarded verbatim);
-	// large parseable values are forwarded unclamped (upper-clamp tracked to Phase 6).
+	// a value above maxHistoryLength is clamped client-side with a warning (CO-8).
 	opts := client.GetOpts{IncludeArtifacts: mustBool(flags, flagIncludeArtifacts)}
 	if flags.Changed(flagHistory) {
 		n, herr := flags.GetInt(flagHistory)
@@ -117,6 +122,12 @@ func runGet(cmd *cobra.Command, args []string) error {
 		if n < 0 {
 			return usageError(r, "--history must be zero or a positive number")
 		}
+		// Upper clamp (CO-8 / R-3): bound an absurd value client-side. The ints in
+		// the warning are CLI-authored args, not server-derived (CO-5 unaffected).
+		if n > maxHistoryLength {
+			r.Warn("--history %d exceeds the client maximum of %d; clamping to %d", n, maxHistoryLength, maxHistoryLength)
+			n = maxHistoryLength
+		}
 		opts.HistoryLength = &n
 	}
 
@@ -125,18 +136,15 @@ func runGet(cmd *cobra.Command, args []string) error {
 	defer stop()
 
 	cl, err := client.New(ctx, client.Options{
-		ServiceURL: serviceURL,
-		CardURL:    cfg.String(flagCardURL),
-		Transport:  cfg.String(flagTransport),
-		A2AVersion: cfg.String(flagA2AVersion),
-		Insecure:   mustBool(flags, flagInsecure),
-		Timeout:    mustDuration(flags, flagTimeout),
-		Creds: &client.CallerSuppliedProvider{
-			Bearer: cfg.String(flagBearer),
-			APIKey: cfg.String(flagAPIKey),
-			Extra:  headers,
-		},
-		Warnf: r.Warn,
+		ServiceURL:            serviceURL,
+		CardURL:               cfg.String(flagCardURL),
+		Transport:             cfg.String(flagTransport),
+		A2AVersion:            cfg.String(flagA2AVersion),
+		Insecure:              mustBool(flags, flagInsecure),
+		Timeout:               mustDuration(flags, flagTimeout),
+		Creds:                 resolveCredentials(flags, headers),
+		AllowCrossOriginCreds: mustBool(flags, flagAllowXOrigin),
+		Warnf:                 r.Warn,
 	})
 	if err != nil {
 		return renderAndReturn(r, err)

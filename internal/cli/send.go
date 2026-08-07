@@ -144,18 +144,15 @@ func runSend(cmd *cobra.Command, args []string) error {
 	defer stop()
 
 	cl, err := client.New(ctx, client.Options{
-		ServiceURL: serviceURL,
-		CardURL:    cfg.String(flagCardURL),
-		Transport:  cfg.String(flagTransport),
-		A2AVersion: cfg.String(flagA2AVersion),
-		Insecure:   mustBool(flags, flagInsecure),
-		Timeout:    mustDuration(flags, flagTimeout),
-		Creds: &client.CallerSuppliedProvider{
-			Bearer: cfg.String(flagBearer),
-			APIKey: cfg.String(flagAPIKey),
-			Extra:  headers,
-		},
-		Warnf: r.Warn,
+		ServiceURL:            serviceURL,
+		CardURL:               cfg.String(flagCardURL),
+		Transport:             cfg.String(flagTransport),
+		A2AVersion:            cfg.String(flagA2AVersion),
+		Insecure:              mustBool(flags, flagInsecure),
+		Timeout:               mustDuration(flags, flagTimeout),
+		Creds:                 resolveCredentials(flags, headers),
+		AllowCrossOriginCreds: mustBool(flags, flagAllowXOrigin),
+		Warnf:                 r.Warn,
 	})
 	if err != nil {
 		return renderAndReturn(r, err)
@@ -409,6 +406,34 @@ func usageError(r *render.Renderer, msg string) error {
 	_ = r.RenderError(e.ToEnvelope())
 	e.MarkRendered()
 	return e
+}
+
+// resolveCredentials builds the caller-supplied credential provider with the
+// §10.1 precedence explicit flag > environment variable > unset: --bearer pairs
+// with A2A_BEARER and --api-key with A2A_API_KEY. -H/--header stays flag-only.
+// Credentials are never persisted (design §191): this only reads flags/env.
+func resolveCredentials(flags *pflag.FlagSet, headers map[string]string) *client.CallerSuppliedProvider {
+	return &client.CallerSuppliedProvider{
+		Bearer: flagOrEnv(flags, flagBearer, envBearer),
+		APIKey: flagOrEnv(flags, flagAPIKey, envAPIKey),
+		Extra:  headers,
+	}
+}
+
+// flagOrEnv returns the string flag value when the user set it explicitly, else
+// the environment variable when present, else the flag's built-in default. This
+// keeps the credential precedence (flag > env > unset) independent of the viper
+// config chain, which uses the A2A_CLI_ prefix rather than the §10.1 names.
+func flagOrEnv(flags *pflag.FlagSet, flagName, envName string) string {
+	if flags.Changed(flagName) {
+		v, _ := flags.GetString(flagName)
+		return v
+	}
+	if v, ok := os.LookupEnv(envName); ok {
+		return v
+	}
+	v, _ := flags.GetString(flagName)
+	return v
 }
 
 // parseHeaders parses repeatable -H "Name: Value" flags into a map, validating

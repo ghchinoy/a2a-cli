@@ -51,15 +51,30 @@ const (
 // during the fetch and surfaces as the existing unreachable/parse failure.
 const maxCardBytes = 4 << 20 // 4 MiB
 
+// maxDataPlaneBytes caps the send/get/cancel (and streaming) data-plane response
+// body as defense-in-depth (CO-8): F-3's card-only cap left the data plane open to
+// an unbounded task/artifact/history body. 64 MiB is far larger than any
+// legitimate Tier-1 task result — generous enough not to break normal artifacts or
+// history — while still preventing an OOM from a hostile or runaway server. It is
+// a var (not a const) only so tests can exercise the cap cheaply; production keeps
+// the default. The cap applies cumulatively across a streamed response too, which
+// at 64 MiB is well beyond any legitimate Tier-1 stream.
+var maxDataPlaneBytes int64 = 64 << 20 // 64 MiB
+
 // errCardTooLarge is returned when a card body exceeds maxCardBytes.
 var errCardTooLarge = errors.New("agent card response exceeds size limit (4 MiB)")
 
+// errBodyTooLarge is returned when a data-plane response body exceeds the cap.
+var errBodyTooLarge = errors.New("agent response exceeds size limit")
+
 // limitedRT wraps a RoundTripper and caps every response body at limit bytes so a
-// single fetch cannot exhaust memory (audit F-3). It is installed only on the
-// card-fetch client, not on the send/get data-plane transport.
+// single fetch cannot exhaust memory (audit F-3, CO-8). It guards both the
+// card-fetch client and the send/get/cancel data-plane transport; onExceed is the
+// error surfaced when the cap is hit so each caller reports the right context.
 type limitedRT struct {
-	base  http.RoundTripper
-	limit int64
+	base     http.RoundTripper
+	limit    int64
+	onExceed error
 }
 
 func (l limitedRT) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -67,25 +82,30 @@ func (l limitedRT) RoundTrip(req *http.Request) (*http.Response, error) {
 	if err != nil {
 		return resp, err
 	}
-	resp.Body = &limitedBody{r: resp.Body, remaining: l.limit}
+	onExceed := l.onExceed
+	if onExceed == nil {
+		onExceed = errBodyTooLarge
+	}
+	resp.Body = &limitedBody{r: resp.Body, remaining: l.limit, onExceed: onExceed}
 	return resp, nil
 }
 
 // limitedBody caps the number of bytes readable from a response body. Once the
-// cap is exceeded it returns errCardTooLarge instead of more data.
+// cap is exceeded it returns onExceed instead of more data.
 type limitedBody struct {
 	r         io.ReadCloser
 	remaining int64
+	onExceed  error
 }
 
 func (b *limitedBody) Read(p []byte) (int, error) {
 	if b.remaining < 0 {
-		return 0, errCardTooLarge
+		return 0, b.onExceed
 	}
 	n, err := b.r.Read(p)
 	b.remaining -= int64(n)
 	if b.remaining < 0 {
-		return n, errCardTooLarge
+		return n, b.onExceed
 	}
 	return n, err
 }
@@ -101,7 +121,11 @@ type Options struct {
 	Insecure   bool               // skip TLS verification (emits a warning)
 	Timeout    time.Duration      // overall per-operation deadline (0 = default only)
 	Creds      CredentialProvider // per-request credential seam
-	Warnf      func(string, ...any)
+	// AllowCrossOriginCreds opts in to forwarding caller credentials to a
+	// cross-origin or downgraded interface target (D5 / CO-7). Off by default:
+	// credentials are withheld from such a target unless this is set.
+	AllowCrossOriginCreds bool
+	Warnf                 func(string, ...any)
 }
 
 // Client wraps an a2aclient.Client with envelope-returning methods.
@@ -142,15 +166,18 @@ func New(ctx context.Context, opts Options) (*Client, error) {
 		opts.warnf("WARNING: TLS certificate verification is disabled (--insecure)")
 		transport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
 	}
+	// Both the data-plane and card-fetch clients wrap the same base transport with a
+	// response-body size cap (audit F-3, CO-8): the card fetch is bounded at
+	// maxCardBytes and the send/get/cancel (and streaming) data plane at the more
+	// generous maxDataPlaneBytes, so neither an oversized card nor an unbounded task/
+	// artifact/history body can exhaust memory.
 	httpClient := &http.Client{
 		Timeout:   defaultHTTPTimeout,
-		Transport: transport,
+		Transport: limitedRT{base: transport, limit: maxDataPlaneBytes, onExceed: errBodyTooLarge},
 	}
-	// The card-fetch client wraps the same transport with a body-size cap (audit
-	// F-3): only the card fetch is bounded, not the data-plane send/get responses.
 	cardHTTPClient := &http.Client{
 		Timeout:   defaultHTTPTimeout,
-		Transport: limitedRT{base: transport, limit: maxCardBytes},
+		Transport: limitedRT{base: transport, limit: maxCardBytes, onExceed: errCardTooLarge},
 	}
 
 	// When --timeout is set, bound the card-fetch/connect phase on the context too.
@@ -190,11 +217,27 @@ func New(ctx context.Context, opts Options) (*Client, error) {
 	// a --a2a-version override on send/get. Registering an exact-version key makes
 	// the version the user signals the one actually sent on every request (AC#5).
 	factoryOpts := transportFactoryOptions(a2a.ProtocolVersion(version), httpClient)
+	// Per-target credential gate (D5 / CO-7): withhold caller credentials from a
+	// cross-origin or downgraded interface unless the operator opts in. The
+	// interface URL is passed to warnf as an ARG (never baked into a format
+	// constant) so the render chokepoint sanitizes it (CO-5).
 	if opts.Creds != nil {
-		factoryOpts = append(factoryOpts, a2aclient.WithCallInterceptors(&authInterceptor{
-			provider: opts.Creds,
-			target:   Target{URL: iface.URL, Transport: transportName},
-		}))
+		risky := sel.crossOrigin || sel.downgraded
+		switch decideCredentials(risky, credentialsPresent(opts.Creds), opts.AllowCrossOriginCreds) {
+		case credWithholdWarn:
+			opts.warnf("WARNING: not forwarding caller credentials to %s target %s; re-run with --allow-cross-origin-credentials to send them", crossOriginLabel(sel), iface.URL)
+		case credAttachWarn:
+			opts.warnf("WARNING: forwarding caller credentials to %s target %s (--allow-cross-origin-credentials)", crossOriginLabel(sel), iface.URL)
+			factoryOpts = append(factoryOpts, a2aclient.WithCallInterceptors(&authInterceptor{
+				provider: opts.Creds,
+				target:   Target{URL: iface.URL, Transport: transportName},
+			}))
+		default: // credAttachSilently
+			factoryOpts = append(factoryOpts, a2aclient.WithCallInterceptors(&authInterceptor{
+				provider: opts.Creds,
+				target:   Target{URL: iface.URL, Transport: transportName},
+			}))
+		}
 	}
 
 	sdk, err := a2aclient.NewFromEndpoints(ctx, []*a2a.AgentInterface{iface}, factoryOpts...)
@@ -535,29 +578,108 @@ func summarizeArtifacts(tr *envelope.TaskResult) {
 	}
 }
 
-// classify maps an SDK/transport error to a normalized clierr.Error. Connection
-// failures become unreachable (exit 3); a task-not-found is normalized to
-// NOT_FOUND (CO-2); everything else is generic (exit 1). The normalization keys
-// off the SDK's binding-independent sentinels (a2a.ErrTaskNotFound), which both
-// the JSON-RPC (-32001) and REST (404/TASK_NOT_FOUND) transports resolve to, so
-// the same A2A error yields the same tool result regardless of binding (§9.4).
-// Richer cross-binding error normalization is Phase 6.
+// classify maps an SDK/transport error to a normalized clierr.Error so the SAME
+// A2A error yields the SAME tool-level Kind/exit/envelope regardless of binding
+// (§9.4). Normalization keys off the SDK's binding-independent sentinels, which
+// both the JSON-RPC (numeric codes) and HTTP+JSON (google.rpc.Status reason)
+// transports resolve to (design §9.4):
+//   - connection failure          -> UNREACHABLE (exit 3)
+//   - context deadline / cancel    -> TIMEOUT (exit 7) / propagated
+//   - a2a.ErrTaskNotFound          -> NOT_FOUND (envelope) / exit 1 GENERIC (CO-2:
+//     §9.5 has no dedicated NOT_FOUND slot; the machine-readable envelope still
+//     carries code=NOT_FOUND + a2aCode=TASK_NOT_FOUND)
+//   - a2a.ErrUnauthenticated/Unauthorized -> AUTH_REQUIRED (exit 4)
+//   - a2a.ErrVersionNotSupported   -> GENERIC (exit 1) with a clear, distinct
+//     message (D3: surfaced, never a silent downgrade)
+//   - everything else              -> GENERIC (exit 1)
+//
+// The underlying A2A reason is preserved on A2ACode for the envelope/debugging.
 func classify(err error, msg string) error {
 	if err == nil {
 		return nil
+	}
+	// Context signals first: a cancellation (SIGINT) propagates unchanged so callers
+	// can keep an already-surfaced taskId; a deadline is a TIMEOUT (exit 7).
+	if errors.Is(err, context.Canceled) {
+		return err
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return clierr.Wrap(clierr.KindTimeout, msg+": "+err.Error(), err)
 	}
 	var netErr net.Error
 	var opErr *net.OpError
 	if errors.As(err, &opErr) || errors.As(err, &netErr) {
 		return clierr.Wrap(clierr.KindUnreachable, msg+": "+err.Error(), err)
 	}
-	if errors.Is(err, a2a.ErrTaskNotFound) {
-		e := clierr.Wrap(clierr.KindNotFound, msg+": "+err.Error(), err)
-		// Preserve the underlying A2A reason for debugging (design §3.4).
-		e.A2ACode = a2a.ErrorReason(err)
-		return e
+	switch {
+	case errors.Is(err, a2a.ErrTaskNotFound):
+		return withReason(clierr.KindNotFound, msg+": "+err.Error(), err)
+	case errors.Is(err, a2a.ErrUnauthenticated), errors.Is(err, a2a.ErrUnauthorized):
+		// A server-returned auth error normalizes to AUTH_REQUIRED (exit 4) on every
+		// command and binding, matching a credential-provider failure (design §10.1).
+		return withReason(clierr.KindAuth, msg+": authentication required or failed: "+err.Error(), err)
+	case errors.Is(err, a2a.ErrVersionNotSupported):
+		// The server rejected the signaled A2A protocol version (spec §11.2). Surface
+		// a clear, distinct message rather than silently downgrading. Exit-code choice
+		// (GENERIC 1) is a reviewer-disposition item — see the Phase-6 dev log.
+		return withReason(clierr.KindGeneric, msg+": the agent does not support the signaled A2A protocol version (set --a2a-version to a supported one): "+err.Error(), err)
 	}
 	return clierr.Wrap(clierr.KindGeneric, msg+": "+err.Error(), err)
+}
+
+// withReason builds a normalized error and preserves the underlying binding-
+// independent A2A reason on A2ACode for the envelope/debugging (design §3.4).
+func withReason(kind clierr.Kind, msg string, err error) *clierr.Error {
+	e := clierr.Wrap(kind, msg, err)
+	e.A2ACode = a2a.ErrorReason(err)
+	return e
+}
+
+// credAction is the outcome of the per-target credential gate (D5 / CO-7).
+type credAction int
+
+const (
+	credAttachSilently credAction = iota // same-origin (or nothing to protect): attach
+	credAttachWarn                       // risky target, opted in: attach + warn
+	credWithholdWarn                     // risky target, not opted in: withhold + warn
+)
+
+// decideCredentials implements the D5 / CO-7 rule: caller credentials are attached
+// to a same-origin target, and to a cross-origin or downgraded ("risky") target
+// ONLY when the operator opts in — otherwise they are withheld with a warning. When
+// there are no credentials to send, a risky target needs no warning (nothing to
+// protect), so it attaches silently (the interceptor is a no-op).
+func decideCredentials(risky, present, optIn bool) credAction {
+	if !risky || !present {
+		return credAttachSilently
+	}
+	if optIn {
+		return credAttachWarn
+	}
+	return credWithholdWarn
+}
+
+// credentialsPresent reports whether the provider would actually attach anything,
+// so the cross-origin warning is only surfaced when it is relevant. A provider that
+// cannot be inspected is treated as carrying credentials (fail safe: still gated).
+func credentialsPresent(p CredentialProvider) bool {
+	type inspectable interface{ HasCredentials() bool }
+	if h, ok := p.(inspectable); ok {
+		return h.HasCredentials()
+	}
+	return p != nil
+}
+
+// crossOriginLabel describes why a target is credential-gated, for the warning.
+func crossOriginLabel(sel *selection) string {
+	switch {
+	case sel.crossOrigin && sel.downgraded:
+		return "cross-origin, downgraded"
+	case sel.downgraded:
+		return "downgraded"
+	default:
+		return "cross-origin"
+	}
 }
 
 // authInterceptor attaches per-request credentials from a CredentialProvider to

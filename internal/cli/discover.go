@@ -101,18 +101,15 @@ func runDiscover(cmd *cobra.Command, _ []string) error {
 	defer stop()
 
 	cl, err := client.New(ctx, client.Options{
-		ServiceURL: serviceURL,
-		CardURL:    cardURL,
-		Transport:  cfg.String(flagTransport),
-		A2AVersion: cfg.String(flagA2AVersion),
-		Insecure:   mustBool(flags, flagInsecure),
-		Timeout:    mustDuration(flags, flagTimeout),
-		Creds: &client.CallerSuppliedProvider{
-			Bearer: cfg.String(flagBearer),
-			APIKey: cfg.String(flagAPIKey),
-			Extra:  headers,
-		},
-		Warnf: r.Warn,
+		ServiceURL:            serviceURL,
+		CardURL:               cardURL,
+		Transport:             cfg.String(flagTransport),
+		A2AVersion:            cfg.String(flagA2AVersion),
+		Insecure:              mustBool(flags, flagInsecure),
+		Timeout:               mustDuration(flags, flagTimeout),
+		Creds:                 resolveCredentials(flags, headers),
+		AllowCrossOriginCreds: mustBool(flags, flagAllowXOrigin),
+		Warnf:                 r.Warn,
 	})
 	if err != nil {
 		// Card-fetch/connection failures classify as unreachable (exit 3), matching
@@ -126,7 +123,10 @@ func runDiscover(cmd *cobra.Command, _ []string) error {
 		if verr := cl.ValidateCard(); verr != nil {
 			return renderAndReturn(r, verr)
 		}
-		r.Warn("card is valid against the A2A card schema")
+		// CO-6 / F-5: --validate is a STRUCTURAL / required-field conformance aid, not
+		// a full JSON-Schema validation and not a security check. Word the success
+		// message so it does not overstate what was checked.
+		r.Warn("card passed structural validation (required fields present; not a full JSON-Schema or security check)")
 	}
 
 	return r.RenderCard(cl.FullCard())
