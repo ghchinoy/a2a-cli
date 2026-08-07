@@ -81,6 +81,15 @@ func NewRootCommand() *cobra.Command {
 		return cmd.Help()
 	}
 
+	// Validate the -o/--output VALUE in ONE central place so it covers every
+	// command (design §3.5 / spec §9): a bad value (e.g. -o yaml) is a USAGE error
+	// (exit 2), not a silent fallback to text. Because the requested output mode is
+	// itself unusable, the diagnostic is emitted as TEXT on stderr (never json/yaml)
+	// and marked rendered so the Execute-level handler does not re-render it.
+	root.PersistentPreRunE = func(cmd *cobra.Command, _ []string) error {
+		return validateOutputFlag(cmd.Flags())
+	}
+
 	pf := root.PersistentFlags()
 	pf.StringP(flagServiceURL, "u", "", "base URL of the A2A agent")
 	pf.String(flagContextID, "", "context ID to continue a conversation")
@@ -101,6 +110,7 @@ func NewRootCommand() *cobra.Command {
 	pf.StringArrayP(flagHeader, "H", nil, "extra header in 'Name: Value' form (repeatable)")
 	pf.Bool(flagInsecure, false, "skip TLS certificate verification (emits a warning)")
 
+	root.AddCommand(newDiscoverCommand())
 	root.AddCommand(newSendCommand())
 	return root
 }
@@ -135,6 +145,26 @@ func renderTopLevelError(flags *pflag.FlagSet, err error) {
 		return
 	}
 	_ = r.RenderError(envelope.CLIError{Code: string(clierr.KindGeneric), Message: err.Error()})
+}
+
+// validOutputValues is the set of accepted -o/--output values. "tui" is accepted
+// but degrades to text at Tier 1 (design §3.8); "text"/"json" are the real modes.
+var validOutputValues = map[string]bool{"text": true, "json": true, "tui": true}
+
+// validateOutputFlag rejects an unknown -o/--output value as a USAGE error
+// (exit 2, addendum CO-1). The diagnostic is rendered as TEXT on stderr — the
+// requested mode is invalid, so we must not try to emit json — and marked
+// rendered so cli.Execute does not surface it a second time.
+func validateOutputFlag(flags *pflag.FlagSet) error {
+	o, err := flags.GetString(flagOutput)
+	if err != nil || validOutputValues[strings.ToLower(o)] {
+		return nil
+	}
+	e := clierr.New(clierr.KindUsage, fmt.Sprintf("invalid --output value %q (want text|json)", o))
+	r := render.New(render.ModeText, os.Stdout, os.Stderr)
+	_ = r.RenderError(e.ToEnvelope())
+	e.MarkRendered()
+	return e
 }
 
 // modeFromFlags infers the output mode from -n/--no-tui and -o/--output. On a
