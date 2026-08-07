@@ -81,9 +81,17 @@ them back so your next invocation can reuse them.
 ## Text vs JSON
 
 The default output is human-readable **text**. For scripting, switch to **JSON** with `-o json` (or
-its shorthand `-n`). Only `text` and `json` are valid; today an unrecognized value (e.g. `-o yaml`)
-is silently treated as `text` rather than rejected — stricter validation of `--output` is landing
-shortly, so don't rely on the silent fallback.
+its shorthand `-n`). The accepted values are `text`, `json`, and `tui`; `tui` is reserved for a
+future interactive mode and degrades to `text` at Tier 1. An unrecognized value is rejected with a
+usage error (exit `2`) rather than silently falling back:
+
+```bash
+a2a-cli send "hi" -u http://127.0.0.1:9001 -o yaml
+```
+
+```text
+Error [USAGE]: invalid --output value "yaml" (want one of: text, json, tui)
+```
 
 ```bash
 a2a-cli send "hello" -u http://127.0.0.1:9001 -o json

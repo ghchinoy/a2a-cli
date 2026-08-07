@@ -166,6 +166,11 @@ Selected transport: http-json -> http://127.0.0.1:9001
   reason: card-declared preference (first supported interface: http-json)
 ```
 
+The exact `reason` string above assumes a **clean session** (no stored transport). If a prior
+`send`/`discover` has persisted `transport: http-json` to `session.json`, the stored value is treated
+as an explicit override and the reason instead reads `explicit --transport=http-json`; delete the
+session file (see T5) to reproduce the card-declared-preference wording.
+
 `-o json` (or `-n`) emits the normalized card envelope on stdout — every field above plus
 `defaultInputModes` / `defaultOutputModes` and the `selection` object — and nothing else:
 
@@ -276,6 +281,7 @@ stderr is not discarded.
 | `0` | Task completed | `a2a-cli send "hi" -u http://127.0.0.1:9001` | ✅ |
 | `2` | Usage error | `a2a-cli send -u http://127.0.0.1:9001` (no message arg) → `Error [USAGE]: send requires exactly one <text> argument` | ✅ |
 | `2` | Usage error | `a2a-cli send "hi" -u http://127.0.0.1:9001 --transport grpc` → `Error [USAGE]: transport not supported at Tier 1: grpc` | ✅ |
+| `2` | Usage error | `a2a-cli send "hi" -u http://127.0.0.1:9001 -o yaml` → `Error [USAGE]: invalid --output value "yaml" (want one of: text, json, tui)` | ✅ |
 | `3` | Unreachable | `a2a-cli send "hi" -u http://127.0.0.1:9999` → `Error [UNREACHABLE]: ...connection refused` | ✅ |
 
 Check a code explicitly:
@@ -462,14 +468,11 @@ merged build.
 
 Observations from validating the merged build, flagged for the lead/reviewer:
 
-1. **Invalid `-o` value is silently accepted.** `a2a-cli send "hi" -u <url> -o yaml` does not error;
-   it falls back to text output and exits `0`. Spec §9 treats bad flag values as a usage error
-   (exit `2`). Confirm whether Phase 1 intends to validate the `--output` value.
-2. **`--task-id <missing>` returns a raw generic error (exit `1`).** Against the sample server,
+1. **`--task-id <missing>` returns a raw generic error (exit `1`).** Against the sample server,
    `--task-id nonexistent` yields `code: "GENERIC"` with the SDK's `"task not found"` message rather
    than a normalized `NOT_FOUND` code. Full continuation semantics (spec §6.2, "surface server error,
    not silently start a new task") are a Phase 4 concern; noting that the current code path surfaces
    the error but does not yet normalize it.
-3. **No `--continue` / `--last` flag yet.** Session auto-supplies the last service URL, which covers
+2. **No `--continue` / `--last` flag yet.** Session auto-supplies the last service URL, which covers
    part of spec §6.4, but the named flag is not present. Expected at Phase 4 — documented as pending,
    not as working.
