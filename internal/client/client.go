@@ -61,6 +61,8 @@ type Client struct {
 	card      *a2a.AgentCard
 	transport string
 	url       string
+	routingID string
+	reason    string
 	version   string
 	timeout   time.Duration
 }
@@ -112,6 +114,7 @@ func New(ctx context.Context, opts Options) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
+	reason := selectionReason(card, opts.Transport, transportName)
 	// Signal the requested/default protocol version by pinning the selected
 	// interface's version; the SDK sets the A2A-Version header from it on every
 	// request (spec §11.2). This guarantees a non-empty value.
@@ -141,6 +144,8 @@ func New(ctx context.Context, opts Options) (*Client, error) {
 		card:      card,
 		transport: transportName,
 		url:       iface.URL,
+		routingID: iface.Tenant,
+		reason:    reason,
 		version:   version,
 		timeout:   opts.Timeout,
 	}, nil
@@ -191,6 +196,33 @@ func (c *Client) URL() string { return c.url }
 // Card returns the normalized agent card.
 func (c *Client) Card() *envelope.Card {
 	return envelope.FromCard(c.card, c.transport, c.url)
+}
+
+// FullCard returns the complete normalized agent card for `discover`, with the
+// transport selection (chosen binding/URL, reason, routing id) attached
+// (design §8.1/§11.1).
+func (c *Client) FullCard() *envelope.FullCard {
+	return envelope.FromFullCard(c.card, envelope.CardSelection{
+		Transport: c.transport,
+		URL:       c.url,
+		Reason:    c.reason,
+		RoutingID: c.routingID,
+	})
+}
+
+// ValidateCard validates the resolved card against the A2A card schema
+// (design §8.1 --validate). A malformed/invalid card is returned as a generic
+// error (non-zero exit) whose message lists every problem found.
+func (c *Client) ValidateCard() error {
+	problems := envelope.ValidateCard(c.card)
+	if len(problems) == 0 {
+		return nil
+	}
+	msg := "agent card failed validation:"
+	for _, p := range problems {
+		msg += "\n  - " + p
+	}
+	return clierr.New(clierr.KindGeneric, msg)
 }
 
 // SendRequest is the input to Send.

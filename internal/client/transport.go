@@ -92,3 +92,21 @@ func selectInterface(card *a2a.AgentCard, requested, serviceURL string) (*a2a.Ag
 	iface := a2a.NewAgentInterface(serviceURL, a2a.TransportProtocolHTTPJSON)
 	return iface, TransportHTTPJSON, nil
 }
+
+// selectionReason explains, in one human-readable line, why selectInterface
+// chose the transport it did (design §11.1, surfaced by `discover`). It mirrors
+// selectInterface's precedence without re-deciding it: it is called with the
+// same inputs and the already-chosen transport name.
+func selectionReason(card *a2a.AgentCard, requested, selected string) string {
+	if requested != "" {
+		return "explicit --transport=" + requested
+	}
+	if card != nil {
+		for _, iface := range card.SupportedInterfaces {
+			if iface != nil && supported[iface.ProtocolBinding] {
+				return "card-declared preference (first supported interface: " + selected + ")"
+			}
+		}
+	}
+	return "default HTTP+JSON (card declared no transport this client speaks)"
+}
