@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
+  "name": "a2a-cli",
+  "version": "0.1.0",
+  "description": "A conformant Tier-1 A2A protocol command-line client, bundled with a single generic skill that teaches an agent to drive it. Run 'a2a-cli help' and 'a2a-cli <command> --help' to discover the command surface.",
+  "author": {
+    "name": "The A2A Authors"
+  },
+  "homepage": "https://github.com/ghchinoy/a2a-cli",
+  "repository": "https://github.com/ghchinoy/a2a-cli",
+  "license": "Apache-2.0",
+  "keywords": ["a2a", "agent2agent", "cli", "agent", "protocol"],
+  "skills": "./skill/"
+}
