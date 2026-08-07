@@ -98,6 +98,32 @@ func TestFromTask_ArtifactsAndStatusMessage(t *testing.T) {
 	}
 }
 
+// TestFromTask_History confirms the additive History field is normalized from the
+// SDK Task history (surfaced by `get --history <n>`) and stays absent otherwise.
+func TestFromTask_History(t *testing.T) {
+	task := &a2a.Task{
+		ID:        "t",
+		ContextID: "c",
+		Status:    a2a.TaskStatus{State: a2a.TaskStateCompleted},
+		History: []*a2a.Message{
+			a2a.NewMessage(a2a.MessageRoleUser, a2a.NewTextPart("hello")),
+			a2a.NewMessage(a2a.MessageRoleAgent, a2a.NewTextPart("hi there")),
+		},
+	}
+	tr := FromTask(task)
+	if len(tr.History) != 2 {
+		t.Fatalf("history len = %d, want 2: %+v", len(tr.History), tr.History)
+	}
+	if tr.History[0].Parts[0].Text != "hello" || tr.History[1].Parts[0].Text != "hi there" {
+		t.Errorf("history not normalized: %+v", tr.History)
+	}
+
+	// A task without history yields no History field (omitempty stability).
+	if tr := FromTask(&a2a.Task{ID: "t", Status: a2a.TaskStatus{State: a2a.TaskStateWorking}}); tr.History != nil {
+		t.Errorf("History should be nil when absent, got %+v", tr.History)
+	}
+}
+
 func TestPartFromSDK_ContentKinds(t *testing.T) {
 	if got := partFromSDK(a2a.NewTextPart("x")); got.Text != "x" {
 		t.Errorf("text part = %+v", got)
