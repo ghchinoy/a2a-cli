@@ -46,6 +46,11 @@ type TaskResult struct {
 	State     string     `json:"state"`
 	Artifacts []Artifact `json:"artifacts,omitempty"`
 	Message   *Message   `json:"message"`
+	// History is the task's message history, surfaced by `get --history <n>`. It is
+	// an ADDITIVE, backward-compatible field (omitempty): it never appears unless a
+	// server returns history, so the frozen send-path json shape (design §4.2/§6) is
+	// unaffected.
+	History []Message `json:"history,omitempty"`
 }
 
 // CLIError is the Appendix B error object — normalized across transports (§9.4).
@@ -131,6 +136,14 @@ func FromTask(t *a2a.Task) *TaskResult {
 	}
 	if t.Status.Message != nil {
 		tr.Message = messageFromSDK(t.Status.Message)
+	}
+	// History is normalized when the server returns it (populated by `get
+	// --history <n>`, which threads HistoryLength on the request). It stays absent
+	// otherwise, so the field is additive and does not perturb the send-path shape.
+	for _, m := range t.History {
+		if nm := messageFromSDK(m); nm != nil {
+			tr.History = append(tr.History, *nm)
+		}
 	}
 	return tr
 }

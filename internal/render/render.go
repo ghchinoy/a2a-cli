@@ -57,7 +57,9 @@ func New(mode Mode, out, err io.Writer) *Renderer {
 // INVARIANT — do NOT add another `fmt.Fprint*` to r.out/r.err anywhere in this
 // package. Route text through emit so sanitization holds by construction; the
 // ONLY sanctioned raw writer is writeJSON (the -o json stdout envelope, which
-// encoding/json already single-escapes — re-sanitizing would corrupt it).
+// encoding/json already single-escapes — re-sanitizing would corrupt it). Pass
+// untrusted (server/card-derived) content as a string/error arg, NEVER baked into
+// the `format` constant and never via a non-string type through %v (CO-5).
 func (r *Renderer) emit(w io.Writer, clean func(string) string, format string, args ...any) {
 	for i, a := range args {
 		switch v := a.(type) {
@@ -106,8 +108,20 @@ func (r *Renderer) renderTaskText(tr *envelope.TaskResult) error {
 		if label == "" {
 			label = a.ArtifactID
 		}
+		// With --include-artifacts the client keeps artifact Parts, so contents are
+		// rendered; without it the Parts are summarized away and only the identifier
+		// line is shown (spec §8.3). Both routes go through the emit chokepoint.
 		if text := joinParts(a.Parts); text != "" {
 			r.emit(w, sanitizeTerminal, "Artifact %s: %s\n", label, text)
+		} else {
+			r.emit(w, sanitizeTerminal, "Artifact %s\n", nonEmpty(label))
+		}
+	}
+	// Message history, surfaced by `get --history <n>`. Each entry is server-derived
+	// and routed through the emit chokepoint (CO-5).
+	for _, m := range tr.History {
+		if text := joinParts(m.Parts); text != "" {
+			r.emit(w, sanitizeTerminal, "History %s: %s\n", nonEmpty(m.Role), text)
 		}
 	}
 	if tr.TaskID != nil {

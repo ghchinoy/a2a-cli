@@ -321,17 +321,76 @@ func (c *Client) Send(ctx context.Context, req SendRequest) (*envelope.TaskResul
 	return envelope.FromSendResult(res), nil
 }
 
-// GetTask fetches the current state of a task (used by the poll loop).
-func (c *Client) GetTask(ctx context.Context, id string) (*envelope.TaskResult, error) {
-	task, err := c.sdk.GetTask(ctx, &a2a.GetTaskRequest{ID: a2a.TaskID(id)})
+// GetOpts configures a GetTask call (design §3.3). HistoryLength, when non-nil,
+// is threaded to the SDK as the server-side history bound (`get --history <n>`).
+// IncludeArtifacts is a client-side content control: the SDK always returns the
+// full task, so when false the wrapper summarizes artifacts by dropping their
+// Parts (identifiers/names are kept) — "contents vs summarized" per spec §8.3.
+type GetOpts struct {
+	IncludeArtifacts bool
+	HistoryLength    *int
+}
+
+// GetTask fetches the current state of a task (used one-shot by `get` and by the
+// poll loop). opts.HistoryLength is threaded to the request; opts.IncludeArtifacts
+// controls whether artifact contents are returned or summarized.
+func (c *Client) GetTask(ctx context.Context, id string, opts GetOpts) (*envelope.TaskResult, error) {
+	req := &a2a.GetTaskRequest{ID: a2a.TaskID(id)}
+	if opts.HistoryLength != nil {
+		req.HistoryLength = opts.HistoryLength
+	}
+	task, err := c.sdk.GetTask(ctx, req)
 	if err != nil {
 		return nil, classify(err, "get task failed")
+	}
+	tr := envelope.FromTask(task)
+	if !opts.IncludeArtifacts {
+		summarizeArtifacts(tr)
+	}
+	return tr, nil
+}
+
+// CancelTask requests cancellation of a task and returns the resulting state
+// (spec §8.4). Cancellation is idempotent: a server may reject cancelling an
+// already-terminal task with a not-cancelable error, so the wrapper falls back to
+// a GetTask to report the resulting state cleanly rather than surfacing a spurious
+// error on a repeat cancel. A task-not-found is normalized to KindNotFound (CO-2).
+func (c *Client) CancelTask(ctx context.Context, id string) (*envelope.TaskResult, error) {
+	if c.timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, c.timeout)
+		defer cancel()
+	}
+	task, err := c.sdk.CancelTask(ctx, &a2a.CancelTaskRequest{ID: a2a.TaskID(id)})
+	if err != nil {
+		// Already-terminal task: cancel is a no-op. Report the current state so the
+		// command stays idempotent and still satisfies "MUST report the resulting
+		// state" (§8.4). If the follow-up get also fails, surface the original error.
+		if errors.Is(err, a2a.ErrTaskNotCancelable) {
+			if tr, gerr := c.GetTask(ctx, id, GetOpts{IncludeArtifacts: true}); gerr == nil {
+				return tr, nil
+			}
+		}
+		return nil, classify(err, "cancel failed")
 	}
 	return envelope.FromTask(task), nil
 }
 
+// summarizeArtifacts drops artifact Parts (content) while keeping identifiers and
+// names, implementing the default `get` behavior (artifacts summarized unless
+// --include-artifacts is set, spec §8.3).
+func summarizeArtifacts(tr *envelope.TaskResult) {
+	for i := range tr.Artifacts {
+		tr.Artifacts[i].Parts = nil
+	}
+}
+
 // classify maps an SDK/transport error to a normalized clierr.Error. Connection
-// failures become unreachable (exit 3); everything else is generic (exit 1).
+// failures become unreachable (exit 3); a task-not-found is normalized to
+// NOT_FOUND (CO-2); everything else is generic (exit 1). The normalization keys
+// off the SDK's binding-independent sentinels (a2a.ErrTaskNotFound), which both
+// the JSON-RPC (-32001) and REST (404/TASK_NOT_FOUND) transports resolve to, so
+// the same A2A error yields the same tool result regardless of binding (§9.4).
 // Richer cross-binding error normalization is Phase 6.
 func classify(err error, msg string) error {
 	if err == nil {
@@ -341,6 +400,12 @@ func classify(err error, msg string) error {
 	var opErr *net.OpError
 	if errors.As(err, &opErr) || errors.As(err, &netErr) {
 		return clierr.Wrap(clierr.KindUnreachable, msg+": "+err.Error(), err)
+	}
+	if errors.Is(err, a2a.ErrTaskNotFound) {
+		e := clierr.Wrap(clierr.KindNotFound, msg+": "+err.Error(), err)
+		// Preserve the underlying A2A reason for debugging (design §3.4).
+		e.A2ACode = a2a.ErrorReason(err)
+		return e
 	}
 	return clierr.Wrap(clierr.KindGeneric, msg+": "+err.Error(), err)
 }
