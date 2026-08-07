@@ -120,6 +120,15 @@ func TestDiscover_Validate_ValidCard(t *testing.T) {
 	if !strings.Contains(errOut, "valid") {
 		t.Errorf("expected a validity note on stderr, got %q", errOut)
 	}
+	// CO-6 / D4: the success message must scope what was checked to STRUCTURAL /
+	// required-field conformance and must NOT overstate it as a full JSON-Schema or
+	// security check (that would mislead operators into trusting an unvetted card).
+	if !strings.Contains(errOut, "structural") {
+		t.Errorf("validity note should describe a STRUCTURAL check, got %q", errOut)
+	}
+	if !strings.Contains(strings.ToLower(errOut), "not a full json-schema") {
+		t.Errorf("validity note must not overstate the check (should disclaim full JSON-Schema), got %q", errOut)
+	}
 	if !strings.Contains(out, "Name:") {
 		t.Errorf("valid card should still present normally, got %q", out)
 	}

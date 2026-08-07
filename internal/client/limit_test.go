@@ -31,7 +31,7 @@ func TestLimitedRT_CapsBody(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	client := &http.Client{Transport: limitedRT{base: http.DefaultTransport, limit: limit}}
+	client := &http.Client{Transport: limitedRT{base: http.DefaultTransport, limit: limit, onExceed: errCardTooLarge}}
 	resp, err := client.Get(srv.URL)
 	if err != nil {
 		t.Fatalf("GET: %v", err)
@@ -53,7 +53,7 @@ func TestLimitedRT_AllowsSmallBody(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	client := &http.Client{Transport: limitedRT{base: http.DefaultTransport, limit: limit}}
+	client := &http.Client{Transport: limitedRT{base: http.DefaultTransport, limit: limit, onExceed: errCardTooLarge}}
 	resp, err := client.Get(srv.URL)
 	if err != nil {
 		t.Fatalf("GET: %v", err)
