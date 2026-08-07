@@ -98,7 +98,7 @@ Both Go servers reply with a **direct message** (not a stateful task), so `taskI
 `--stream` and the command surface, but neither server maintains a task store, so `get`/`cancel`
 against a **real** task cannot be exercised here — only their `NOT_FOUND` path is (a known task id
 never exists). Task-only states (`WORKING`, `INPUT_REQUIRED`, `FAILED`, artifacts) likewise cannot be
-produced. Steps that need those are marked **◑ Partial** / **⏳ Pending** and require a richer server.
+produced. Steps that need those are marked **◑ Partial** / **⏳ Deferred** and require a richer server.
 
 > **Note on the Python multi-transport server.** The `a2a-python` hello-world server exposes all
 > three transports and both protocol versions at once and is the natural fixture for cross-transport
@@ -479,7 +479,7 @@ terminal/interrupted state, `--watch` reporting each transition on stderr) and `
 reconciles with a `get` after any stream (re)connect and **falls back to the poll loop** if the
 stream drops). Blocking to a terminal state is verified in T1; NDJSON stream records in T3.
 
-**◑ Partial / ⏳ Pending:** the polling loop's **interrupted-state stop**, `--timeout` → exit `7`
+**◑ Partial / ⏳ Deferred:** the polling loop's **interrupted-state stop**, `--timeout` → exit `7`
 with the `taskId` preserved, SIGINT interruptibility, and a **forced stream drop → poll fallback →
 reconcile** all need a **long-running / task-producing** agent — the Go hello-world servers complete
 instantly with a message and open no task. The wait/reconcile logic (`internal/poll`, the
