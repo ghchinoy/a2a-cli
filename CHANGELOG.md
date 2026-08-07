@@ -18,7 +18,7 @@ _No release has been tagged yet; the Tier-1 command surface is merged and the pr
 - **Multi-turn conversations** — a local session store records the last service URL, transport, `contextId`, and task id; resume with `--continue` / `--last`, and inspect or clear it with `session show` / `session clear`. [#6]
 - **`send --stream`** — stream results over SSE when the agent card advertises the streaming capability, emitting newline-delimited JSON (NDJSON) under `-o json`; falls back to the blocking poll path when streaming is not advertised. [#8]
 - **Caller-supplied authentication** — attach credentials with `--bearer`, `--api-key`, or repeatable `-H` headers (or the `A2A_BEARER` / `A2A_API_KEY` environment variables), and signal the protocol version with `--a2a-version`. [#9]
-- **Deterministic exit-code scheme** (spec §9.5) mapping outcomes to stable process exit codes: `0` success, `1` failure, `2` usage, `3` unreachable, `4` auth, `5` task failed, `6` input required, `7` timeout. [#9]
+- **Deterministic exit-code scheme** (spec §9.5) mapping outcomes to stable process exit codes: `0` success, `1` failure, `2` usage, `3` unreachable, `4` auth, `5` task failed, `6` input required, `7` timeout. [#1]
 - **Bundled agent skill and self-installable plugin** — [`skill/SKILL.md`](skill/SKILL.md) teaches an agent to drive the CLI non-interactively, packaged as a Claude Code plugin via [`plugin.json`](plugin.json). [#10]
 
 ### Security
