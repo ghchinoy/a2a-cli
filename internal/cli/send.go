@@ -29,11 +29,14 @@ import (
 )
 
 func newSendCommand() *cobra.Command {
-	return &cobra.Command{
+	cmd := &cobra.Command{
 		Use:   "send <text>",
 		Short: "Send a message to an agent and wait for the result",
 		Long: "Send a message to an A2A agent over HTTP+JSON (blocking by default) and " +
-			"print the normalized result. Use -o json for machine-readable output.",
+			"print the normalized result. Use -o json for machine-readable output. " +
+			"With --stream the result is streamed via SSE and reconciled with a get; " +
+			"if the card does not advertise streaming, or the stream fails, it falls " +
+			"back to the blocking poll path.",
 		Args: func(_ *cobra.Command, args []string) error {
 			if len(args) != 1 {
 				return clierr.New(clierr.KindUsage, "send requires exactly one <text> argument")
@@ -42,6 +45,11 @@ func newSendCommand() *cobra.Command {
 		},
 		RunE: runSend,
 	}
+	// --stream is send-specific (spec §7.2). It never silently changes behavior: an
+	// agent that does not advertise streaming, or a stream that fails, falls back to
+	// the blocking poll path.
+	cmd.Flags().Bool(flagStream, false, "stream results via SSE, falling back to polling on failure")
+	return cmd
 }
 
 func runSend(cmd *cobra.Command, args []string) error {
@@ -153,11 +161,30 @@ func runSend(cmd *cobra.Command, args []string) error {
 		return renderAndReturn(r, err)
 	}
 
-	tr, err := cl.Send(ctx, client.SendRequest{
+	req := client.SendRequest{
 		Text:      text,
 		ContextID: cfg.String(flagContextID),
 		TaskID:    cfg.String(flagTaskID),
-	})
+	}
+
+	// --stream prefers SSE (spec §7.2) but degrades safely: if the card does not
+	// advertise streaming it never attempts a stream (§11.3), and any stream failure
+	// falls back to the blocking poll path (§7.3). Both routes reconcile the final
+	// state with a get before reporting, share the exit-code mapping, and honor
+	// --continue/--last (req is built identically).
+	if mustBool(flags, flagStream) {
+		return runSendStream(ctx, flags, r, cl, sess, req, serviceURL)
+	}
+	return runSendBlocking(ctx, flags, r, cl, sess, req, serviceURL)
+}
+
+// runSendBlocking is the non-streaming send path (spec §7): send, surface the
+// taskId, persist the session, poll to a terminal/interrupted state, render, and
+// map the state to an exit code. It is also the fallback target for --stream when
+// streaming is unsupported or fails before a task materializes (§7.3), so there is a
+// single implementation of the blocking behavior.
+func runSendBlocking(ctx context.Context, flags *pflag.FlagSet, r *render.Renderer, cl *client.Client, sess *session.Session, req client.SendRequest, serviceURL string) error {
+	tr, err := cl.Send(ctx, req)
 	if err != nil {
 		return renderAndReturn(r, err)
 	}
@@ -195,20 +222,127 @@ func runSend(cmd *cobra.Command, args []string) error {
 	if err := r.RenderTask(tr); err != nil {
 		return err
 	}
+	return exitForState(r, tr)
+}
 
-	// Map the final state to an exit code (design §3.5). Interrupted states also
-	// get a resume hint on stderr.
-	if stateErr := clierr.FromState(tr.State); stateErr != nil {
-		if envelope.IsInterrupted(tr.State) {
-			r.ResumeHint(tr.TaskID)
-		}
-		// The task itself has already been rendered above; this error is purely an
-		// exit-code carrier, so mark it rendered to avoid a duplicate diagnostic
-		// from the top-level handler.
-		stateErr.MarkRendered()
-		return stateErr
+// runSendStream is the --stream send path (spec §7.2/§7.3). It gates on the card's
+// streaming capability, renders events as they arrive, reconciles the final state
+// with a get, and falls back to the blocking path on any failure — never hanging.
+func runSendStream(ctx context.Context, flags *pflag.FlagSet, r *render.Renderer, cl *client.Client, sess *session.Session, req client.SendRequest, serviceURL string) error {
+	// Capability gate (§11.3): if the card does not advertise streaming, do NOT
+	// attempt a stream — use the blocking poll path instead of hanging.
+	if !cl.SupportsStreaming() {
+		r.Warn("agent card does not advertise streaming; using the blocking request path")
+		return runSendBlocking(ctx, flags, r, cl, sess, req, serviceURL)
 	}
-	return nil
+
+	// Render each event as it arrives (§7.2). The handler consumes envelope types
+	// only (import boundary §3.2) and routes every server-derived value through the
+	// render chokepoint (CO-5).
+	handler := func(ev envelope.StreamEvent) error { return r.RenderStreamEvent(ev) }
+
+	snap, serr := cl.SendStream(ctx, req, handler)
+	if errors.Is(serr, client.ErrStreamingUnsupported) {
+		// Defensive: SupportsStreaming already gated, but keep the contract that this
+		// sentinel always means "fall back", never "fail".
+		r.Warn("agent card does not advertise streaming; using the blocking request path")
+		return runSendBlocking(ctx, flags, r, cl, sess, req, serviceURL)
+	}
+
+	// Surface the taskId to stderr the moment it exists so it survives a later
+	// drop/timeout/SIGINT (§7.3). Never fabricate ids (§6.1).
+	if snap != nil && snap.TaskID != nil {
+		r.Warn("task %s created (context %s)", *snap.TaskID, ptrOr(snap.ContextID, "-"))
+	}
+	if snap != nil {
+		if err := captureSession(sess, snap, serviceURL, cl.Transport()); err != nil {
+			r.Warn("WARNING: could not persist session: %v", err)
+		}
+	}
+
+	// No task materialized: either a bare Message reply (hello-world) or a failure
+	// before any task existed. On failure fall back to a blocking send (the stream
+	// may never have reached the server); on a clean Message stream, report it.
+	if snap == nil || snap.TaskID == nil {
+		if serr != nil {
+			if errors.Is(serr, context.Canceled) {
+				return renderAndReturn(r, serr)
+			}
+			r.Warn("stream failed before a task was created; falling back to a blocking request")
+			return runSendBlocking(ctx, flags, r, cl, sess, req, serviceURL)
+		}
+		tr := snap
+		if tr == nil {
+			tr = &envelope.TaskResult{State: envelope.StateUnspecified}
+		}
+		if err := r.RenderStreamFinal(tr); err != nil {
+			return err
+		}
+		return exitForState(r, tr)
+	}
+
+	// A task exists. Reconcile the authoritative final state with a get before
+	// reporting (§7.2/§7.3: the reconciled get is authoritative, not the last
+	// streamed event), then poll to terminal if the stream ended early (drop).
+	tr := snap
+	if serr != nil {
+		if errors.Is(serr, context.Canceled) {
+			// SIGINT: the taskId is already on stderr; surface a resume hint and stop.
+			r.ResumeHint(tr.TaskID)
+			return renderAndReturn(r, serr)
+		}
+		r.Warn("stream interrupted (%v); reconciling final state via get", serr)
+	}
+
+	getFn := func(c context.Context) (*envelope.TaskResult, error) {
+		return cl.GetTask(c, ptrOr(tr.TaskID, ""), client.GetOpts{IncludeArtifacts: true})
+	}
+	if reconciled, gerr := getFn(ctx); gerr == nil && reconciled != nil {
+		tr = reconciled
+	} else if gerr != nil {
+		// A terminal streamed snapshot whose get now fails (e.g. task already expired)
+		// is still reportable from the stream; a non-terminal one is not, so surface
+		// the error with a resume hint.
+		if !envelope.IsTerminal(tr.State) && !envelope.IsInterrupted(tr.State) {
+			r.ResumeHint(tr.TaskID)
+			return renderAndReturn(r, gerr)
+		}
+		r.Warn("could not reconcile final state via get (%v); reporting the last streamed state", gerr)
+	}
+
+	if !envelope.IsTerminal(tr.State) && !envelope.IsInterrupted(tr.State) {
+		final, perr := poll.Wait(ctx, tr, getFn, poll.Options{
+			Interval: mustDuration(flags, flagPollInterval),
+			Timeout:  mustDuration(flags, flagTimeout),
+		})
+		if final != nil {
+			tr = final
+		}
+		if perr != nil {
+			r.ResumeHint(tr.TaskID)
+			return renderAndReturn(r, perr)
+		}
+	}
+
+	if err := r.RenderStreamFinal(tr); err != nil {
+		return err
+	}
+	return exitForState(r, tr)
+}
+
+// exitForState maps a final task state to the exit-code-carrying error (design
+// §3.5). Interrupted states also get a resume hint on stderr. The task has already
+// been rendered, so the error is marked rendered to avoid a duplicate diagnostic.
+func exitForState(r *render.Renderer, tr *envelope.TaskResult) error {
+	stateErr := clierr.FromState(tr.State)
+	if stateErr == nil {
+		return nil
+	}
+	if envelope.IsInterrupted(tr.State) {
+		r.ResumeHint(tr.TaskID)
+	}
+	stateErr.MarkRendered()
+	return stateErr
 }
 
 // captureSession persists the latest conversation identifiers (spec §6.4).

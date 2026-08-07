@@ -56,10 +56,13 @@ func New(mode Mode, out, err io.Writer) *Renderer {
 //
 // INVARIANT — do NOT add another `fmt.Fprint*` to r.out/r.err anywhere in this
 // package. Route text through emit so sanitization holds by construction; the
-// ONLY sanctioned raw writer is writeJSON (the -o json stdout envelope, which
-// encoding/json already single-escapes — re-sanitizing would corrupt it). Pass
-// untrusted (server/card-derived) content as a string/error arg, NEVER baked into
-// the `format` constant and never via a non-string type through %v (CO-5).
+// ONLY sanctioned raw writers are writeJSON (the -o json stdout envelope) and
+// writeStreamLine (one compact -o json --stream NDJSON record) — both hand off to
+// encoding/json, which already single-escapes control bytes, so re-sanitizing
+// would corrupt them. Pass untrusted (server/card-derived) content as a
+// string/error arg, NEVER baked into the `format` constant and never via a
+// non-string type through %v (CO-5). This holds for the streaming render paths
+// (RenderStreamEvent/RenderStreamFinal) exactly as for the one-shot renderers.
 func (r *Renderer) emit(w io.Writer, clean func(string) string, format string, args ...any) {
 	for i, a := range args {
 		switch v := a.(type) {
@@ -128,6 +131,68 @@ func (r *Renderer) renderTaskText(tr *envelope.TaskResult) error {
 		r.emit(w, sanitizeTerminal, "\nResume:    a2a-cli send --task-id %s \"<reply>\"\n", *tr.TaskID)
 	}
 	return nil
+}
+
+// RenderStreamEvent renders one streaming event as it arrives (spec §7.2). In json
+// mode it emits the event as a single NDJSON record on stdout (one JSON object per
+// line, each carrying a `type` field); in text mode it prints a human-readable,
+// sanitized line per event through the emit chokepoint. Every server-derived value
+// (state, ids, artifact/message text) is passed as a string arg so CO-5 sanitization
+// holds by construction on the new streaming render path.
+func (r *Renderer) RenderStreamEvent(ev envelope.StreamEvent) error {
+	if r.Mode == ModeJSON {
+		return writeStreamLine(r.out, ev)
+	}
+	return r.renderStreamEventText(ev)
+}
+
+// renderStreamEventText prints one streaming event for a TTY. All server-derived
+// content routes through the emit chokepoint (sanitizeTerminal); only the
+// CLI-authored labels are trusted (CO-5).
+func (r *Renderer) renderStreamEventText(ev envelope.StreamEvent) error {
+	w := r.out
+	switch ev.Type {
+	case envelope.StreamTypeTask:
+		r.emit(w, sanitizeTerminal, "Task:      %s [%s]\n", ptr(ev.TaskID), nonEmpty(ev.State))
+	case envelope.StreamTypeStatus:
+		r.emit(w, sanitizeTerminal, "Status:    %s\n", nonEmpty(ev.State))
+		if ev.Message != nil {
+			if text := joinParts(ev.Message.Parts); text != "" {
+				r.emit(w, sanitizeTerminal, "  message: %s\n", text)
+			}
+		}
+	case envelope.StreamTypeArtifact:
+		if ev.Artifact != nil {
+			label := ev.Artifact.Name
+			if label == "" {
+				label = ev.Artifact.ArtifactID
+			}
+			if text := joinParts(ev.Artifact.Parts); text != "" {
+				r.emit(w, sanitizeTerminal, "Artifact %s: %s\n", nonEmpty(label), text)
+			} else {
+				r.emit(w, sanitizeTerminal, "Artifact %s\n", nonEmpty(label))
+			}
+		}
+	case envelope.StreamTypeMessage:
+		if ev.Message != nil {
+			if text := joinParts(ev.Message.Parts); text != "" {
+				r.emit(w, sanitizeTerminal, "Message:   %s\n", text)
+			}
+		}
+	}
+	return nil
+}
+
+// RenderStreamFinal renders the reconciled terminal result of a stream (spec §7.3).
+// In json mode it emits the `final` NDJSON record so stdout stays one-object-per-line;
+// in text mode it prints the same labeled task view as the blocking path (including
+// the resume hint), so `send --stream` and `send` converge on an identical terminal
+// presentation.
+func (r *Renderer) RenderStreamFinal(tr *envelope.TaskResult) error {
+	if r.Mode == ModeJSON {
+		return writeStreamLine(r.out, envelope.FinalStreamEvent(tr))
+	}
+	return r.renderTaskText(tr)
 }
 
 // RenderCard writes a FullCard (design §8.1). In json mode it emits only the
@@ -287,6 +352,17 @@ func writeJSON(w io.Writer, v any) error {
 	enc := json.NewEncoder(w)
 	enc.SetEscapeHTML(false)
 	enc.SetIndent("", "  ")
+	return enc.Encode(v)
+}
+
+// writeStreamLine emits v as a single NDJSON record: compact (no indent) so the
+// whole object stays on one line, with the trailing newline Encode already writes.
+// It is a sanctioned raw stdout writer (see the emit INVARIANT): encoding/json
+// single-escapes control bytes, so the CO-5 terminal sanitizer must NOT run over it
+// (that would corrupt the JSON). Successive calls produce valid NDJSON on stdout.
+func writeStreamLine(w io.Writer, v any) error {
+	enc := json.NewEncoder(w)
+	enc.SetEscapeHTML(false)
 	return enc.Encode(v)
 }
 

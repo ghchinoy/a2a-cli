@@ -34,6 +34,7 @@ const (
 	flagTaskID       = "task-id"
 	flagContinue     = "continue"
 	flagLast         = "last"
+	flagStream       = "stream"
 	flagOutput       = "output"
 	flagNoTUI        = "no-tui"
 	flagTransport    = "transport"
