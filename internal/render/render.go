@@ -322,6 +322,23 @@ func (r *Renderer) RenderSession(sv *envelope.SessionView) error {
 	return nil
 }
 
+// RenderStreamError writes a terminal stream error on the `send --stream` path
+// (R2-1). In json mode it emits a TYPED NDJSON error record via writeStreamLine so
+// stdout stays one-object-per-line with every object carrying a `type` (spec §9.1) —
+// the untyped one-shot error envelope would break the NDJSON contract after event
+// lines were already written. In text mode it is identical to RenderError (a stderr
+// diagnostic through the emit chokepoint), so text behavior is unchanged. taskID/
+// contextID are included when known. It routes through the sanctioned sinks only
+// (writeStreamLine / RenderError->emit), so no new raw out/err seam is introduced.
+func (r *Renderer) RenderStreamError(ce envelope.CLIError, taskID, contextID *string) error {
+	if r.Mode == ModeJSON {
+		// encoding/json already single-escapes control bytes; do NOT run the terminal
+		// sanitizer over the NDJSON record (that would corrupt it).
+		return writeStreamLine(r.out, envelope.ErrorStreamEvent(ce, taskID, contextID))
+	}
+	return r.RenderError(ce)
+}
+
 // RenderError writes a normalized error. In json mode the Appendix B error object
 // goes to stdout (still valid JSON); in text mode a human message goes to stderr.
 func (r *Renderer) RenderError(ce envelope.CLIError) error {

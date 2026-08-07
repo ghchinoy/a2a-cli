@@ -91,6 +91,17 @@ func TestFromEvent_TranslatesEachConcreteType(t *testing.T) {
 	})
 }
 
+// G9 — an unrecognized event maps to StreamTypeUnknown (the FromEvent default
+// branch), so a future/unknown SDK event type is never silently mis-typed. a2a.Event
+// is a sealed union, so a nil event is the only "unrecognized" value constructible
+// outside the handled concrete types; it must land in the default branch.
+func TestFromEvent_UnrecognizedEvent_MapsToUnknown(t *testing.T) {
+	se := FromEvent(nil)
+	if se.Type != StreamTypeUnknown {
+		t.Errorf("type = %q, want %q", se.Type, StreamTypeUnknown)
+	}
+}
+
 // A terminal NDJSON record must carry the Appendix B task-operation fields and a
 // type discriminator, all on one line — that is the shape `-o json --stream`
 // promises consumers (spec §9.1).

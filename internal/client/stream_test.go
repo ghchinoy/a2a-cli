@@ -153,6 +153,39 @@ func TestSendStream_TaskFirstThenEventsInOrder(t *testing.T) {
 	}
 }
 
+// G5 — applyStreamEvent must UNION artifacts: a Task snapshot that already carries an
+// artifact, followed by a TaskArtifactUpdateEvent, must accumulate to two (the update
+// appends, it does not replace). This is the incremental-artifact accumulation the
+// reconcile/render paths depend on (spec §8.2).
+func TestApplyStreamEvent_ArtifactAppend(t *testing.T) {
+	snap := &envelope.TaskResult{State: envelope.StateUnspecified}
+	tid, cid := "t1", "c1"
+
+	applyStreamEvent(snap, envelope.StreamEvent{
+		Type:      envelope.StreamTypeTask,
+		TaskID:    &tid,
+		ContextID: &cid,
+		State:     envelope.StateWorking,
+		Artifacts: []envelope.Artifact{{ArtifactID: "a1", Name: "first", Parts: []envelope.Part{{Text: "one"}}}},
+	})
+	if len(snap.Artifacts) != 1 {
+		t.Fatalf("after the Task event, artifacts = %d, want 1", len(snap.Artifacts))
+	}
+
+	applyStreamEvent(snap, envelope.StreamEvent{
+		Type:      envelope.StreamTypeArtifact,
+		TaskID:    &tid,
+		ContextID: &cid,
+		Artifact:  &envelope.Artifact{ArtifactID: "a2", Name: "second", Parts: []envelope.Part{{Text: "two"}}},
+	})
+	if len(snap.Artifacts) != 2 {
+		t.Fatalf("a subsequent artifactUpdate must APPEND (union), got %d artifacts", len(snap.Artifacts))
+	}
+	if snap.Artifacts[0].Name != "first" || snap.Artifacts[1].Name != "second" {
+		t.Errorf("artifact order/content not preserved: %+v", snap.Artifacts)
+	}
+}
+
 // classifyStream must give context signals priority so a stalled stream bounded by
 // --timeout maps to a TIMEOUT (exit 7) and a SIGINT-style cancellation propagates
 // as context.Canceled (so the caller keeps the already-surfaced taskId).

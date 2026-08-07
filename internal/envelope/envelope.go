@@ -79,6 +79,7 @@ const (
 	StreamTypeArtifact = "artifact" // a TaskArtifactUpdateEvent
 	StreamTypeMessage  = "message"  // a bare Message (e.g. the hello-world reply)
 	StreamTypeFinal    = "final"    // the reconciled terminal result (§7.3)
+	StreamTypeError    = "error"    // a mid-stream/terminal error or cancel (§9.1)
 	StreamTypeUnknown  = "unknown"  // an event of an unrecognized concrete type
 )
 
@@ -173,6 +174,38 @@ type CLIError struct {
 	Code    string `json:"code"`
 	Message string `json:"message"`
 	A2ACode any    `json:"a2aCode"`
+}
+
+// StreamErrorEvent is the TYPED terminal error record on the `-o json --stream`
+// NDJSON path (spec §9.1: every object MUST carry a `type`). When a stream ends in
+// an error or cancel, event lines have already been written to stdout, so the
+// terminal error must ALSO be a typed NDJSON record — not the untyped one-shot
+// Appendix B error envelope — or the trailing object breaks the one-object-per-line
+// contract. It carries the Appendix B error fields (code/message/a2aCode) plus the
+// task-operation ids when known (null when the stream never surfaced a task), and a
+// `type` of StreamTypeError. The non-streaming error envelope (CLIError) is
+// unchanged; this shape is additive and used only on the streaming NDJSON path.
+type StreamErrorEvent struct {
+	Type      string  `json:"type"`
+	Code      string  `json:"code"`
+	Message   string  `json:"message"`
+	A2ACode   any     `json:"a2aCode"`
+	TaskID    *string `json:"taskId"`
+	ContextID *string `json:"contextId"`
+}
+
+// ErrorStreamEvent builds the typed terminal error record from a normalized
+// Appendix B error plus the task ids known at the point of failure (either may be
+// nil — never fabricate ids, design §6.1).
+func ErrorStreamEvent(ce CLIError, taskID, contextID *string) StreamErrorEvent {
+	return StreamErrorEvent{
+		Type:      StreamTypeError,
+		Code:      ce.Code,
+		Message:   ce.Message,
+		A2ACode:   ce.A2ACode,
+		TaskID:    taskID,
+		ContextID: contextID,
+	}
 }
 
 // Message is a normalized message (e.g. the agent's reply when the server

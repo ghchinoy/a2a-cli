@@ -17,6 +17,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/ghchinoy/a2a-cli/internal/session"
 )
 
 // --- SSE test fixtures --------------------------------------------------------
@@ -110,10 +112,15 @@ type streamConfig struct {
 	events       []map[string]any // StreamResponse objects emitted as SSE data blocks
 	streamStatus int              // non-zero -> return this HTTP status on the stream (connect error)
 	streamHang   bool             // block the stream endpoint until the request context is done
+	emitThenHang bool             // emit events, then block until the request context is done
+	emitted      chan struct{}    // closed after events are flushed (with emitThenHang)
+	getStatus    int              // non-zero -> return this HTTP status on GetTask (reconcile failure)
 	getTask      map[string]any   // raw Task returned for GetTask (reconcile)
 	sendResult   map[string]any   // StreamResponse returned for the blocking SendMessage fallback
 	getCalls     *int32           // incremented on each GetTask
 	sendCalls    *int32           // incremented on each (blocking) SendMessage
+	gotContextID *string          // captured message.contextId from the stream request
+	gotTaskID    *string          // captured message.taskId from the stream request
 }
 
 // newStreamServer builds an httptest server that serves the card and a JSON-RPC
@@ -131,15 +138,31 @@ func newStreamServer(t *testing.T, cfg streamConfig) *httptest.Server {
 		var req struct {
 			ID     string `json:"id"`
 			Method string `json:"method"`
+			Params struct {
+				Message struct {
+					ContextID string `json:"contextId"`
+					TaskID    string `json:"taskId"`
+				} `json:"message"`
+			} `json:"params"`
 		}
 		_ = json.NewDecoder(r.Body).Decode(&req)
 
 		switch req.Method {
 		case "SendStreamingMessage":
+			if cfg.gotContextID != nil {
+				*cfg.gotContextID = req.Params.Message.ContextID
+			}
+			if cfg.gotTaskID != nil {
+				*cfg.gotTaskID = req.Params.Message.TaskID
+			}
 			serveStream(t, w, r, req.ID, cfg)
 		case "GetTask":
 			if cfg.getCalls != nil {
 				atomic.AddInt32(cfg.getCalls, 1)
+			}
+			if cfg.getStatus != 0 {
+				w.WriteHeader(cfg.getStatus)
+				return
 			}
 			writeRPCResult(w, req.ID, cfg.getTask)
 		case "SendMessage":
@@ -185,6 +208,16 @@ func serveStream(t *testing.T, w http.ResponseWriter, r *http.Request, id string
 		}
 		fmt.Fprintf(w, "data: %s\n\n", payload)
 		flusher.Flush()
+	}
+
+	if cfg.emitThenHang {
+		// Events are flushed; signal the test and then block until the client's context
+		// is canceled. This lets a test drive a deterministic mid-stream cancel AFTER a
+		// taskId has been surfaced (the client is parked reading the next event).
+		if cfg.emitted != nil {
+			close(cfg.emitted)
+		}
+		<-r.Context().Done()
 	}
 }
 
@@ -454,6 +487,217 @@ func TestStream_BareMessageOnly_Completes(t *testing.T) {
 	}
 	if !strings.Contains(out, "Hello, world!") {
 		t.Errorf("stdout should render the streamed message, got %q", out)
+	}
+}
+
+// G2(a) — reconcile GetTask FAILS after a TERMINAL streamed snapshot. The stream
+// reaches COMPLETED, so the reconcile failure is non-fatal: the CLI reports the
+// streamed terminal state (exit maps to it), with a warning on stderr (spec §7.3).
+func TestStream_ReconcileGetFails_TerminalSnapshot_ReportsStreamedState(t *testing.T) {
+	cleanConfigDir(t)
+	var getCalls int32
+	srv := newStreamServer(t, streamConfig{
+		streaming: true,
+		events: []map[string]any{
+			taskEvent("t1", "c1", "TASK_STATE_WORKING"),
+			statusEvent("t1", "c1", "TASK_STATE_COMPLETED"),
+		},
+		getStatus: http.StatusInternalServerError, // reconcile get fails
+		getCalls:  &getCalls,
+	})
+
+	out, errOut, code := runCLI(t, "send", "--stream", "-u", srv.URL, "--transport", "jsonrpc", "hi")
+	if code != 0 {
+		t.Fatalf("exit = %d, want 0 (terminal streamed state reported despite reconcile failure)\nstderr: %s", code, errOut)
+	}
+	if atomic.LoadInt32(&getCalls) == 0 {
+		t.Error("expected a reconcile GetTask attempt, got none")
+	}
+	if !strings.Contains(out, "TASK_STATE_COMPLETED") {
+		t.Errorf("should report the streamed terminal state, got %q", out)
+	}
+	if !strings.Contains(errOut, "could not reconcile") {
+		t.Errorf("expected a stderr warning about the failed reconcile, got %q", errOut)
+	}
+}
+
+// G2(b) — reconcile GetTask FAILS after a NON-TERMINAL (WORKING) streamed snapshot.
+// The stream ends before terminal, so the reconcile failure is fatal: the CLI cannot
+// report an authoritative final state. It surfaces the error with a resume hint and a
+// non-zero exit (spec §7.3).
+func TestStream_ReconcileGetFails_NonTerminalSnapshot_ErrorsWithResumeHint(t *testing.T) {
+	cleanConfigDir(t)
+	srv := newStreamServer(t, streamConfig{
+		streaming: true,
+		events:    []map[string]any{taskEvent("t1", "c1", "TASK_STATE_WORKING")}, // never terminal
+		getStatus: http.StatusInternalServerError,
+	})
+
+	_, errOut, code := runCLI(t, "send", "--stream", "-u", srv.URL, "--transport", "jsonrpc", "hi")
+	if code == 0 {
+		t.Fatalf("exit = %d, want non-zero (reconcile failed on a non-terminal task)\nstderr: %s", code, errOut)
+	}
+	if !strings.Contains(errOut, "--task-id t1") {
+		t.Errorf("expected a resume hint carrying the taskId on stderr, got %q", errOut)
+	}
+}
+
+// G3 — the typed NDJSON error record (R2-1). In `-o json --stream`, a terminal error
+// (here a reconcile failure on a non-terminal snapshot) must be emitted as a TYPED
+// NDJSON record carrying `type` plus the Appendix B error fields, so stdout stays
+// valid one-object-per-line NDJSON with every object carrying a `type` (spec §9.1).
+func TestStream_NDJSONError_TypedRecord(t *testing.T) {
+	cleanConfigDir(t)
+	srv := newStreamServer(t, streamConfig{
+		streaming: true,
+		events:    []map[string]any{taskEvent("t1", "c1", "TASK_STATE_WORKING")}, // non-terminal
+		getStatus: http.StatusInternalServerError,                                // reconcile fails
+	})
+
+	out, _, code := runCLI(t, "send", "--stream", "-o", "json", "-u", srv.URL, "--transport", "jsonrpc", "hi")
+	if code == 0 {
+		t.Fatalf("exit = %d, want non-zero", code)
+	}
+	lines := nonEmptyLines(out)
+	if len(lines) < 2 {
+		t.Fatalf("expected at least the task line and the error line, got %d:\n%s", len(lines), out)
+	}
+	// Every stdout object must be valid JSON and carry a `type` — including the error.
+	for i, line := range lines {
+		var obj map[string]any
+		if err := json.Unmarshal([]byte(line), &obj); err != nil {
+			t.Fatalf("line %d is not a valid JSON object: %v\n%q", i, err, line)
+		}
+		if _, ok := obj["type"]; !ok {
+			t.Errorf("line %d missing a type field: %q", i, line)
+		}
+	}
+	last := lastNDJSON(t, out)
+	if last["type"] != "error" {
+		t.Fatalf("terminal record type = %v, want error", last["type"])
+	}
+	if _, ok := last["code"]; !ok {
+		t.Errorf("error record missing the Appendix B code field: %v", last)
+	}
+	if _, ok := last["message"]; !ok {
+		t.Errorf("error record missing the Appendix B message field: %v", last)
+	}
+	if last["taskId"] != "t1" {
+		t.Errorf("error record should carry the known taskId, got %v", last["taskId"])
+	}
+}
+
+// G4 — --continue over --stream forwards the stored contextId on the STREAM request
+// (Phase-4 continuation not regressed through streaming, spec §6.2). --last also
+// forwards the stored latestTaskId.
+func TestStream_ContinueAndLast_ForwardStoredIdsOnStreamRequest(t *testing.T) {
+	t.Run("continue forwards contextId", func(t *testing.T) {
+		cleanConfigDir(t)
+		var gotCtx, gotTask string
+		srv := newStreamServer(t, streamConfig{
+			streaming:    true,
+			events:       []map[string]any{taskEvent("t2", "ctx-stored", "TASK_STATE_COMPLETED")},
+			getTask:      taskJSON("t2", "ctx-stored", "TASK_STATE_COMPLETED"),
+			gotContextID: &gotCtx,
+			gotTaskID:    &gotTask,
+		})
+		if err := session.Save(&session.Session{ContextID: "ctx-stored", LatestTaskID: "task-stored", ServiceURL: srv.URL, Transport: "jsonrpc"}); err != nil {
+			t.Fatalf("seed session: %v", err)
+		}
+
+		_, errOut, code := runCLI(t, "send", "--stream", "--continue", "-u", srv.URL, "--transport", "jsonrpc", "hi")
+		if code != 0 {
+			t.Fatalf("exit = %d, want 0\nstderr: %s", code, errOut)
+		}
+		if gotCtx != "ctx-stored" {
+			t.Errorf("stream request contextId = %q, want the stored ctx-stored", gotCtx)
+		}
+		if gotTask != "" {
+			t.Errorf("--continue must NOT forward the stored taskId, got %q", gotTask)
+		}
+	})
+
+	t.Run("last also forwards taskId", func(t *testing.T) {
+		cleanConfigDir(t)
+		var gotCtx, gotTask string
+		srv := newStreamServer(t, streamConfig{
+			streaming:    true,
+			events:       []map[string]any{taskEvent("task-stored", "ctx-stored", "TASK_STATE_COMPLETED")},
+			getTask:      taskJSON("task-stored", "ctx-stored", "TASK_STATE_COMPLETED"),
+			gotContextID: &gotCtx,
+			gotTaskID:    &gotTask,
+		})
+		if err := session.Save(&session.Session{ContextID: "ctx-stored", LatestTaskID: "task-stored", ServiceURL: srv.URL, Transport: "jsonrpc"}); err != nil {
+			t.Fatalf("seed session: %v", err)
+		}
+
+		_, errOut, code := runCLI(t, "send", "--stream", "--last", "-u", srv.URL, "--transport", "jsonrpc", "hi")
+		if code != 0 {
+			t.Fatalf("exit = %d, want 0\nstderr: %s", code, errOut)
+		}
+		if gotCtx != "ctx-stored" {
+			t.Errorf("stream request contextId = %q, want ctx-stored", gotCtx)
+		}
+		if gotTask != "task-stored" {
+			t.Errorf("--last must forward the stored taskId, got %q", gotTask)
+		}
+	})
+}
+
+// G7 — an empty stream (HTTP 200 then immediate EOF, no data) is the "no events"
+// case: it must fall back to the blocking send path, NOT be surfaced as a timeout
+// (spec §7.3 never hang / degrade safely).
+func TestStream_EmptyStream_FallsBackNotTimeout(t *testing.T) {
+	cleanConfigDir(t)
+	var sendCalls int32
+	srv := newStreamServer(t, streamConfig{
+		streaming:  true,
+		events:     nil, // 200 then EOF, no SSE data blocks
+		sendResult: map[string]any{"task": taskJSON("t1", "c1", "TASK_STATE_COMPLETED")},
+		getTask:    taskJSON("t1", "c1", "TASK_STATE_COMPLETED"),
+		sendCalls:  &sendCalls,
+	})
+
+	out, errOut, code := runCLI(t, "send", "--stream", "--timeout", "5s", "-u", srv.URL, "--transport", "jsonrpc", "hi")
+	if code == 7 {
+		t.Fatalf("an empty stream must not be surfaced as a timeout (exit 7)\nstderr: %s", errOut)
+	}
+	if code != 0 {
+		t.Fatalf("exit = %d, want 0 (clean blocking fallback)\nstderr: %s", code, errOut)
+	}
+	if atomic.LoadInt32(&sendCalls) == 0 {
+		t.Error("expected a blocking SendMessage fallback after the empty stream, got none")
+	}
+	if !strings.Contains(out, "TASK_STATE_COMPLETED") {
+		t.Errorf("fallback should render the completed task, got %q", out)
+	}
+}
+
+// G8 — a non-Task FIRST event (Task-first is the server's obligation, §7.2). The
+// client must tolerate the violation gracefully: no crash, and it still reconciles
+// the authoritative final state via get.
+func TestStream_NonTaskFirstEvent_ToleratedAndReconciles(t *testing.T) {
+	cleanConfigDir(t)
+	var getCalls int32
+	srv := newStreamServer(t, streamConfig{
+		streaming: true,
+		events: []map[string]any{
+			statusEvent("t1", "c1", "TASK_STATE_WORKING"), // status arrives BEFORE any Task
+			statusEvent("t1", "c1", "TASK_STATE_COMPLETED"),
+		},
+		getTask:  taskJSON("t1", "c1", "TASK_STATE_COMPLETED"),
+		getCalls: &getCalls,
+	})
+
+	out, errOut, code := runCLI(t, "send", "--stream", "-u", srv.URL, "--transport", "jsonrpc", "hi")
+	if code != 0 {
+		t.Fatalf("exit = %d, want 0 (must tolerate a non-Task first event)\nstderr: %s", code, errOut)
+	}
+	if atomic.LoadInt32(&getCalls) == 0 {
+		t.Error("expected a reconcile GetTask even when the first event was not a Task, got none")
+	}
+	if !strings.Contains(out, "TASK_STATE_COMPLETED") {
+		t.Errorf("should report the reconciled COMPLETED state, got %q", out)
 	}
 }
 

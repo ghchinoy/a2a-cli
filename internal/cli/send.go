@@ -266,7 +266,13 @@ func runSendStream(ctx context.Context, flags *pflag.FlagSet, r *render.Renderer
 	if snap == nil || snap.TaskID == nil {
 		if serr != nil {
 			if errors.Is(serr, context.Canceled) {
-				return renderAndReturn(r, serr)
+				// Cancel before any task: emit a typed error record on the NDJSON path
+				// (R2-1). No taskId exists yet; carry the contextId if the stream had one.
+				var cid *string
+				if snap != nil {
+					cid = snap.ContextID
+				}
+				return streamErrorReturn(r, serr, nil, cid)
 			}
 			r.Warn("stream failed before a task was created; falling back to a blocking request")
 			return runSendBlocking(ctx, flags, r, cl, sess, req, serviceURL)
@@ -275,8 +281,14 @@ func runSendStream(ctx context.Context, flags *pflag.FlagSet, r *render.Renderer
 		if tr == nil {
 			tr = &envelope.TaskResult{State: envelope.StateUnspecified}
 		}
-		if err := r.RenderStreamFinal(tr); err != nil {
-			return err
+		// R2-2: for a bare-Message stream the handler already rendered the message text
+		// as it arrived, so re-rendering it via the final task view in TEXT mode is
+		// redundant. Emit the terminal record only in NDJSON mode, where Appendix B
+		// still requires the `final` object; text mode keeps just the streamed line.
+		if r.Mode == render.ModeJSON {
+			if err := r.RenderStreamFinal(tr); err != nil {
+				return err
+			}
 		}
 		return exitForState(r, tr)
 	}
@@ -288,8 +300,9 @@ func runSendStream(ctx context.Context, flags *pflag.FlagSet, r *render.Renderer
 	if serr != nil {
 		if errors.Is(serr, context.Canceled) {
 			// SIGINT: the taskId is already on stderr; surface a resume hint and stop.
+			// On the NDJSON path emit a TYPED error record carrying the taskId (R2-1).
 			r.ResumeHint(tr.TaskID)
-			return renderAndReturn(r, serr)
+			return streamErrorReturn(r, serr, tr.TaskID, tr.ContextID)
 		}
 		r.Warn("stream interrupted (%v); reconciling final state via get", serr)
 	}
@@ -305,7 +318,7 @@ func runSendStream(ctx context.Context, flags *pflag.FlagSet, r *render.Renderer
 		// the error with a resume hint.
 		if !envelope.IsTerminal(tr.State) && !envelope.IsInterrupted(tr.State) {
 			r.ResumeHint(tr.TaskID)
-			return renderAndReturn(r, gerr)
+			return streamErrorReturn(r, gerr, tr.TaskID, tr.ContextID)
 		}
 		r.Warn("could not reconcile final state via get (%v); reporting the last streamed state", gerr)
 	}
@@ -320,7 +333,7 @@ func runSendStream(ctx context.Context, flags *pflag.FlagSet, r *render.Renderer
 		}
 		if perr != nil {
 			r.ResumeHint(tr.TaskID)
-			return renderAndReturn(r, perr)
+			return streamErrorReturn(r, perr, tr.TaskID, tr.ContextID)
 		}
 	}
 
@@ -370,6 +383,23 @@ func renderAndReturn(r *render.Renderer, err error) error {
 		ce = clierr.Wrap(clierr.KindGeneric, err.Error(), err)
 	}
 	_ = r.RenderError(ce.ToEnvelope())
+	ce.MarkRendered()
+	return ce
+}
+
+// streamErrorReturn is renderAndReturn for the `send --stream` terminal-error/cancel
+// paths (R2-1). It normalizes err to a clierr.Error (wrapping a non-clierr as
+// GENERIC, preserving the cause) exactly as renderAndReturn does, but renders through
+// RenderStreamError so that in `-o json --stream` the error is a TYPED NDJSON record
+// (carrying the Appendix B fields plus taskId/contextId when known) rather than the
+// untyped one-shot envelope — keeping stdout one-object-per-line (spec §9.1). In text
+// mode it is identical to renderAndReturn. The exit-code mapping is unchanged.
+func streamErrorReturn(r *render.Renderer, err error, taskID, contextID *string) error {
+	var ce *clierr.Error
+	if !errors.As(err, &ce) {
+		ce = clierr.Wrap(clierr.KindGeneric, err.Error(), err)
+	}
+	_ = r.RenderStreamError(ce.ToEnvelope(), taskID, contextID)
 	ce.MarkRendered()
 	return ce
 }
