@@ -13,6 +13,7 @@ package cli
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"strings"
 	"time"
@@ -58,6 +59,27 @@ func NewRootCommand() *cobra.Command {
 	root.SetFlagErrorFunc(func(_ *cobra.Command, err error) error {
 		return clierr.Wrap(clierr.KindUsage, err.Error(), err)
 	})
+
+	// Classify an unknown subcommand as a usage error (exit 2) here rather than
+	// letting cobra return its untyped error at the Find stage. A non-nil Args
+	// validator makes Find succeed, so global flags (notably -o/-n) are parsed
+	// before validation runs — that lets the Execute-level renderer honor the
+	// requested output mode. Any positional arg on the root is an unknown command
+	// (design §3.5 exit table); an empty arg list is a bare invocation.
+	root.Args = func(cmd *cobra.Command, args []string) error {
+		if len(args) == 0 {
+			return nil
+		}
+		return clierr.New(clierr.KindUsage, fmt.Sprintf("unknown command %q for %q", args[0], cmd.CommandPath()))
+	}
+	// A RunE makes the root Runnable, so execution reaches Args validation instead
+	// of short-circuiting to help for a non-runnable command (cobra returns
+	// flag.ErrHelp before validating args otherwise). It is reached only for a bare
+	// `a2a-cli` invocation (Args passed with no positionals), where showing help and
+	// exiting 0 is the desired behavior.
+	root.RunE = func(cmd *cobra.Command, _ []string) error {
+		return cmd.Help()
+	}
 
 	pf := root.PersistentFlags()
 	pf.StringP(flagServiceURL, "u", "", "base URL of the A2A agent")

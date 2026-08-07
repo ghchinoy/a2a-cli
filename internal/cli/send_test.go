@@ -94,6 +94,39 @@ func TestExecute_UnknownFlag_RendersOutput(t *testing.T) {
 	}
 }
 
+// C1: an unknown subcommand is a USAGE error (exit 2), rendered through the same
+// Execute-level default path as flag/arg errors — the Appendix B USAGE envelope on
+// stdout in json mode, a stderr diagnostic in text mode. It must not fall through
+// to GENERIC/exit 1 or ignore -o json.
+func TestExecute_UnknownCommand_RendersUsage(t *testing.T) {
+	t.Run("text", func(t *testing.T) {
+		cleanConfigDir(t)
+		out, errOut, code := runCLI(t, "bogus", "hi")
+		if code != 2 {
+			t.Fatalf("exit = %d, want 2", code)
+		}
+		if !strings.Contains(errOut, "USAGE") {
+			t.Errorf("stderr should carry a USAGE diagnostic, got %q", errOut)
+		}
+		if out != "" {
+			t.Errorf("stdout should be empty in text mode, got %q", out)
+		}
+	})
+	t.Run("json", func(t *testing.T) {
+		cleanConfigDir(t)
+		out, errOut, code := runCLI(t, "bogus", "-o", "json", "hi")
+		if code != 2 {
+			t.Fatalf("exit = %d, want 2", code)
+		}
+		if !strings.Contains(out, `"code": "USAGE"`) {
+			t.Errorf("stdout should carry the Appendix B USAGE envelope, got %q", out)
+		}
+		if errOut != "" {
+			t.Errorf("stderr should be empty in json mode (envelope goes to stdout), got %q", errOut)
+		}
+	})
+}
+
 // R-f: a missing service URL (no -u, no session, no env) is a rendered usage error.
 func TestRunSend_MissingURL_Usage(t *testing.T) {
 	cleanConfigDir(t)
