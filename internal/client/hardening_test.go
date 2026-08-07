@@ -17,6 +17,8 @@ package client
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -202,6 +204,63 @@ func TestClassify_VersionMessageIsDistinct(t *testing.T) {
 	msg := got.Error()
 	if !strings.Contains(msg, "version") || !strings.Contains(msg, "--a2a-version") {
 		t.Errorf("version error should name the version problem and --a2a-version, got %q", msg)
+	}
+}
+
+// D1 (R2-3): classify handles the context signals first, before any a2a-sentinel or
+// net-error branch. A cancellation (SIGINT) propagates UNCHANGED so the caller keeps
+// an already-surfaced taskId; a deadline becomes a KindTimeout (exit 7). These lock
+// in the two context arms (regression-proof; not a behavior change).
+func TestClassify_ContextCanceled_PropagatesUnchanged(t *testing.T) {
+	got := classify(context.Canceled, "send failed")
+	// The arm returns the original error verbatim — not wrapped in *clierr.Error.
+	if got != context.Canceled {
+		t.Fatalf("classify(context.Canceled) = %v (%T), want the error propagated unchanged", got, got)
+	}
+	// A bare context.Canceled has no clierr.Kind; ExitCode falls back to the generic
+	// non-nil exit (1), never TIMEOUT/UNREACHABLE.
+	if _, ok := got.(*clierr.Error); ok {
+		t.Errorf("context.Canceled must not be normalized into a *clierr.Error, got %v", got)
+	}
+}
+
+// A wrapped context.Canceled (e.g. an SDK error that carries it) is still detected
+// via errors.Is and propagated unchanged.
+func TestClassify_ContextCanceled_Wrapped(t *testing.T) {
+	wrapped := fmt.Errorf("transport aborted: %w", context.Canceled)
+	got := classify(wrapped, "send failed")
+	if got != wrapped {
+		t.Fatalf("classify(wrapped canceled) = %v, want the wrapped error propagated unchanged", got)
+	}
+}
+
+func TestClassify_DeadlineExceeded_IsTimeout(t *testing.T) {
+	got := classify(context.DeadlineExceeded, "send failed")
+	if clierr.ExitCode(got) != 7 {
+		t.Errorf("exit = %d, want 7 (TIMEOUT) for context.DeadlineExceeded", clierr.ExitCode(got))
+	}
+	ce, ok := got.(*clierr.Error)
+	if !ok {
+		t.Fatalf("classify(context.DeadlineExceeded) = %T, want *clierr.Error", got)
+	}
+	if ce.Kind != clierr.KindTimeout {
+		t.Errorf("kind = %v, want KindTimeout", ce.Kind)
+	}
+	// The op message is preserved and the underlying deadline error is wrapped.
+	if !strings.Contains(ce.Error(), "send failed") {
+		t.Errorf("timeout error should preserve the op message, got %q", ce.Error())
+	}
+	if !errors.Is(got, context.DeadlineExceeded) {
+		t.Errorf("timeout error should still wrap context.DeadlineExceeded, got %v", got)
+	}
+}
+
+// A wrapped context.DeadlineExceeded is detected via errors.Is and mapped to TIMEOUT.
+func TestClassify_DeadlineExceeded_Wrapped(t *testing.T) {
+	wrapped := fmt.Errorf("call timed out: %w", context.DeadlineExceeded)
+	got := classify(wrapped, "get failed")
+	if clierr.ExitCode(got) != 7 {
+		t.Errorf("exit = %d, want 7 (TIMEOUT) for a wrapped deadline", clierr.ExitCode(got))
 	}
 }
 

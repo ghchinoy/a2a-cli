@@ -223,16 +223,20 @@ func New(ctx context.Context, opts Options) (*Client, error) {
 	// constant) so the render chokepoint sanitizes it (CO-5).
 	if opts.Creds != nil {
 		risky := sel.crossOrigin || sel.downgraded
-		switch decideCredentials(risky, credentialsPresent(opts.Creds), opts.AllowCrossOriginCreds) {
+		action := decideCredentials(risky, credentialsPresent(opts.Creds), opts.AllowCrossOriginCreds)
+		// Emit the per-decision warning. The interface URL is a warnf ARG, never baked
+		// into a format constant, so the render chokepoint sanitizes it (CO-5).
+		switch action {
 		case credWithholdWarn:
 			opts.warnf("WARNING: not forwarding caller credentials to %s target %s; re-run with --allow-cross-origin-credentials to send them", crossOriginLabel(sel), iface.URL)
 		case credAttachWarn:
 			opts.warnf("WARNING: forwarding caller credentials to %s target %s (--allow-cross-origin-credentials)", crossOriginLabel(sel), iface.URL)
-			factoryOpts = append(factoryOpts, a2aclient.WithCallInterceptors(&authInterceptor{
-				provider: opts.Creds,
-				target:   Target{URL: iface.URL, Transport: transportName},
-			}))
-		default: // credAttachSilently
+		}
+		// Attach the credential interceptor EXACTLY ONCE, and ONLY on an attach
+		// outcome. On the withhold decision the interceptor is structurally never
+		// appended to factoryOpts before NewFromEndpoints — no seam exists to send
+		// creds to a risky host (CO-7 structural no-leak, not check-then-send).
+		if action != credWithholdWarn {
 			factoryOpts = append(factoryOpts, a2aclient.WithCallInterceptors(&authInterceptor{
 				provider: opts.Creds,
 				target:   Target{URL: iface.URL, Transport: transportName},

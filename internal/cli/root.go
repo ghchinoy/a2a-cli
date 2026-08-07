@@ -130,7 +130,7 @@ func NewRootCommand() *cobra.Command {
 	pf.Bool(flagInsecure, false, "skip TLS certificate verification (emits a warning)")
 	// Off by default: caller credentials are withheld from a cross-origin or
 	// downgraded interface target unless the operator opts in (D5 / CO-7).
-	pf.Bool(flagAllowXOrigin, false, "forward caller credentials to a cross-origin or downgraded interface target (default: withhold)")
+	pf.Bool(flagAllowXOrigin, false, "forward caller credentials to a cross-origin or downgraded interface target (default: withhold); this trusts that target for the full request lifecycle, including any redirects it issues (caller headers are not stripped across redirects)")
 
 	root.AddCommand(newDiscoverCommand())
 	root.AddCommand(newSendCommand())
