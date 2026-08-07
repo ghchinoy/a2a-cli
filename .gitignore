@@ -1,0 +1,10 @@
+# Binaries
+/a2a-cli
+/dist/
+*.exe
+*.test
+*.out
+
+# Editor/OS cruft
+.DS_Store
+*.swp
