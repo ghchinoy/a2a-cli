@@ -275,6 +275,46 @@ func TestSend_Last_ResumesLatestTask(t *testing.T) {
 	}
 }
 
+// CO-3 edge (send.go ~120-122): --last with a stored session whose latestTaskId is
+// EMPTY (e.g. the server previously returned a Message, not a Task) has no task to
+// target. It must NOT error and must NOT bind a stale/empty taskId as a real
+// continuation: it warns on stderr and falls through to a NORMAL new send that still
+// resumes the stored contextId.
+func TestSend_Last_EmptyLatestTask_WarnsAndStartsNewSend(t *testing.T) {
+	cleanConfigDir(t)
+	ss := newSendServer(t, func(sendRecord) (int, any) {
+		return 200, taskResultBody("fresh-task", "ctx-stored", "TASK_STATE_COMPLETED")
+	})
+	// Session exists (so this is the empty-latestTaskId fall-through, NOT the
+	// no-session usage path) but carries no latest task id.
+	if err := session.Save(&session.Session{ContextID: "ctx-stored", LatestTaskID: "", ServiceURL: ss.URL(), Transport: "http-json"}); err != nil {
+		t.Fatalf("seed session: %v", err)
+	}
+
+	out, errOut, code := runCLI(t, "send", "hi", "-u", ss.URL(), "--last", "-o", "json")
+	if code != 0 {
+		t.Fatalf("exit = %d, want 0 (empty latestTaskId is not an error)\nstderr: %s", code, errOut)
+	}
+	recs := ss.records()
+	if len(recs) != 1 {
+		t.Fatalf("want exactly ONE send (a normal new send), got %d: %+v", len(recs), recs)
+	}
+	if recs[0].taskID != "" {
+		t.Errorf("empty latestTaskId must NOT be bound as a continuation, taskId on wire = %q, want empty", recs[0].taskID)
+	}
+	if recs[0].contextID != "ctx-stored" {
+		t.Errorf("context must still resume even when the task does not, contextId on wire = %q, want %q", recs[0].contextID, "ctx-stored")
+	}
+	if !strings.Contains(errOut, "WARNING") || !strings.Contains(errOut, "latest task id") {
+		t.Errorf("expected a stderr WARNING about the missing/empty last task id, got %q", errOut)
+	}
+	// stdout must be a SINGLE clean, valid envelope (no duplicate output).
+	var env map[string]any
+	if err := json.Unmarshal([]byte(out), &env); err != nil {
+		t.Fatalf("stdout is not a single valid JSON envelope: %v\n%s", err, out)
+	}
+}
+
 // CO-3 precedence: explicit --context-id/--task-id MUST override the stored value
 // even under --continue/--last (§6.4 line 168).
 func TestSend_ExplicitOverridesStoredResume(t *testing.T) {
