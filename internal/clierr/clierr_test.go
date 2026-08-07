@@ -48,6 +48,20 @@ func TestExitCode_NilAndUnknown(t *testing.T) {
 	}
 }
 
+// TestNotFound_EnvelopeCodeAndExit locks CO-2's dual contract: KindNotFound is a
+// firm normalized envelope code ("NOT_FOUND") but has no dedicated §3.5 numeric
+// slot, so ExitCode falls to the GENERIC default (1). Phase 6 finalizes the
+// cross-binding numeric mapping.
+func TestNotFound_EnvelopeCodeAndExit(t *testing.T) {
+	e := New(KindNotFound, "task not found")
+	if got := e.ToEnvelope().Code; got != "NOT_FOUND" {
+		t.Errorf("ToEnvelope().Code = %q, want NOT_FOUND", got)
+	}
+	if got := ExitCode(e); got != 1 {
+		t.Errorf("ExitCode(NOT_FOUND) = %d, want 1 (GENERIC default)", got)
+	}
+}
+
 func TestExitCode_WrappedError(t *testing.T) {
 	wrapped := fmt.Errorf("context: %w", New(KindTimeout, "boom"))
 	if got := ExitCode(wrapped); got != 7 {

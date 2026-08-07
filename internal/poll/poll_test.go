@@ -113,6 +113,30 @@ func TestWait_ContextCancel_PreservesTaskID(t *testing.T) {
 	}
 }
 
+// E. A context already canceled before Wait is entered (the SIGINT-before-first-
+// poll edge) must still return the known task with its taskId intact, never lost
+// (§7.3). Complements TestWait_ContextCancel_PreservesTaskID (mid-poll cancel).
+func TestWait_PreCanceledContext_PreservesTaskID(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // canceled before Wait runs
+
+	get := func(context.Context) (*envelope.TaskResult, error) {
+		t.Fatal("get must not be called once the context is already canceled")
+		return nil, nil
+	}
+	initial := &envelope.TaskResult{TaskID: strptr("t1"), State: envelope.StateWorking}
+
+	// A long interval guarantees the ticker is never ready, so the already-ready
+	// ctx.Done() is selected deterministically (no race with a poll tick).
+	tr, err := Wait(ctx, initial, get, Options{Interval: time.Hour})
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("expected context.Canceled, got %v", err)
+	}
+	if tr == nil || tr.TaskID == nil || *tr.TaskID != "t1" {
+		t.Errorf("taskId must be preserved on a pre-canceled context, got %+v", tr)
+	}
+}
+
 func TestWait_GetErrorPropagates(t *testing.T) {
 	sentinel := errors.New("boom")
 	get := func(context.Context) (*envelope.TaskResult, error) { return nil, sentinel }

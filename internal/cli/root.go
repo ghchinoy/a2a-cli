@@ -112,6 +112,8 @@ func NewRootCommand() *cobra.Command {
 
 	root.AddCommand(newDiscoverCommand())
 	root.AddCommand(newSendCommand())
+	root.AddCommand(newGetCommand())
+	root.AddCommand(newCancelCommand())
 	return root
 }
 

@@ -29,6 +29,14 @@ const (
 	KindTaskFailed    Kind = "TASK_FAILED"
 	KindInputRequired Kind = "INPUT_REQUIRED"
 	KindTimeout       Kind = "TIMEOUT"
+	// KindNotFound is the normalized code for a task the server does not know
+	// (CO-2). It is a firm envelope contract — `get <missing>` MUST surface
+	// {code: "NOT_FOUND"} across every binding (§9.4) — but §3.5's numeric exit
+	// table has NO dedicated slot for it, so KindNotFound is deliberately absent
+	// from exitCodes below and ExitCode maps it to the GENERIC default (1). The
+	// cross-binding numeric mapping is finalized in Phase 6; the normalized string
+	// code is the stable deliverable here.
+	KindNotFound Kind = "NOT_FOUND"
 )
 
 // exitCodes maps each Kind to its process exit code (spec §9.5).

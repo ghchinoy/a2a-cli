@@ -135,7 +135,9 @@ func runSend(cmd *cobra.Command, args []string) error {
 	// Go hello-world server returns a terminal Message, so no polling occurs).
 	if !envelope.IsTerminal(tr.State) && !envelope.IsInterrupted(tr.State) {
 		final, perr := poll.Wait(ctx, tr, func(c context.Context) (*envelope.TaskResult, error) {
-			return cl.GetTask(c, ptrOr(tr.TaskID, ""))
+			// Poll with full artifacts so send still renders produced artifacts
+			// (§8.2) — the get-options default summarizes them.
+			return cl.GetTask(c, ptrOr(tr.TaskID, ""), client.GetOpts{IncludeArtifacts: true})
 		}, poll.Options{
 			Interval: mustDuration(flags, flagPollInterval),
 			Timeout:  mustDuration(flags, flagTimeout),

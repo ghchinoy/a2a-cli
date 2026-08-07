@@ -9,6 +9,8 @@
 package envelope
 
 import (
+	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/a2aproject/a2a-go/v2/a2a"
@@ -95,6 +97,57 @@ func TestFromTask_ArtifactsAndStatusMessage(t *testing.T) {
 	}
 	if tr.Message == nil || tr.Message.Parts[0].Text != "done" {
 		t.Errorf("status message not normalized: %+v", tr.Message)
+	}
+}
+
+// TestFromTask_History confirms the additive History field is normalized from the
+// SDK Task history (surfaced by `get --history <n>`) and stays absent otherwise.
+func TestFromTask_History(t *testing.T) {
+	task := &a2a.Task{
+		ID:        "t",
+		ContextID: "c",
+		Status:    a2a.TaskStatus{State: a2a.TaskStateCompleted},
+		History: []*a2a.Message{
+			a2a.NewMessage(a2a.MessageRoleUser, a2a.NewTextPart("hello")),
+			a2a.NewMessage(a2a.MessageRoleAgent, a2a.NewTextPart("hi there")),
+		},
+	}
+	tr := FromTask(task)
+	if len(tr.History) != 2 {
+		t.Fatalf("history len = %d, want 2: %+v", len(tr.History), tr.History)
+	}
+	if tr.History[0].Parts[0].Text != "hello" || tr.History[1].Parts[0].Text != "hi there" {
+		t.Errorf("history not normalized: %+v", tr.History)
+	}
+
+	// A task without history yields no History field (omitempty stability).
+	if tr := FromTask(&a2a.Task{ID: "t", Status: a2a.TaskStatus{State: a2a.TaskStateWorking}}); tr.History != nil {
+		t.Errorf("History should be nil when absent, got %+v", tr.History)
+	}
+}
+
+// F. The additive History field is omitempty: a TaskResult with no history must
+// marshal WITHOUT a "history" key at all, so existing json consumers see the
+// frozen envelope shape (design §3.8, only additive/omitempty fields).
+func TestTaskResult_HistoryOmitemptyJSON(t *testing.T) {
+	id := "t1"
+	tr := TaskResult{TaskID: &id, State: StateCompleted}
+	b, err := json.Marshal(tr)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if strings.Contains(string(b), "history") {
+		t.Errorf("no-history TaskResult must omit the history key, got %s", b)
+	}
+
+	// With history present, the key appears.
+	tr.History = []Message{{Role: "ROLE_USER", Parts: []Part{{Text: "hi"}}}}
+	b, err = json.Marshal(tr)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !strings.Contains(string(b), "history") {
+		t.Errorf("TaskResult with history must include the history key, got %s", b)
 	}
 }
 
