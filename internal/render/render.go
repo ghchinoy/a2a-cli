@@ -230,6 +230,33 @@ func (r *Renderer) renderCardText(c *envelope.FullCard) error {
 	return nil
 }
 
+// RenderSession writes the local session view for `session show` (spec §6.4). In
+// json mode it emits the SessionView object to stdout and nothing else; in text
+// mode it prints the store path and, when a session exists, its labeled fields.
+// Every stored value (serviceURL, ids) is server/user-derived, so each is routed
+// through the emit chokepoint as a string arg (CO-5) — only the CLI-authored
+// labels are trusted.
+func (r *Renderer) RenderSession(sv *envelope.SessionView) error {
+	if sv == nil {
+		return nil
+	}
+	if r.Mode == ModeJSON {
+		return writeJSON(r.out, sv)
+	}
+	w := r.out
+	r.emit(w, sanitizeTerminal, "Path:      %s\n", sv.Path)
+	if !sv.Exists {
+		r.emit(w, sanitizeTerminal, "(no session stored)\n")
+		return nil
+	}
+	r.emit(w, sanitizeTerminal, "Context:   %s\n", nonEmpty(sv.ContextID))
+	r.emit(w, sanitizeTerminal, "Last Task: %s\n", nonEmpty(sv.LatestTaskID))
+	r.emit(w, sanitizeTerminal, "Service:   %s\n", nonEmpty(sv.ServiceURL))
+	r.emit(w, sanitizeTerminal, "Transport: %s\n", nonEmpty(sv.Transport))
+	r.emit(w, sanitizeTerminal, "Updated:   %s\n", nonEmpty(sv.UpdatedAt))
+	return nil
+}
+
 // RenderError writes a normalized error. In json mode the Appendix B error object
 // goes to stdout (still valid JSON); in text mode a human message goes to stderr.
 func (r *Renderer) RenderError(ce envelope.CLIError) error {

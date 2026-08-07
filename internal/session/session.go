@@ -120,6 +120,26 @@ func Save(s *Session) error {
 	return os.Chmod(final, 0o600)
 }
 
+// Delete removes session.json (spec §6.4: persisted state MUST be clearable by
+// the user). It is idempotent — clearing when no session exists is not an error —
+// so `session clear` can be run safely at any time.
+func Delete() error {
+	path, err := Path()
+	if err != nil {
+		return err
+	}
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
+}
+
+// SanitizeURL strips any userinfo (user:password@) from a URL. It reuses the same
+// helper Save applies on write so a caller that RENDERS a stored URL can
+// defensively re-sanitize without importing internal/urlutil directly, keeping the
+// command layer within the import boundary (design §3.2).
+func SanitizeURL(s string) string { return urlutil.Sanitize(s) }
+
 // Load reads the session from disk. It returns (nil, nil) when no session exists.
 func Load() (*Session, error) {
 	path, err := Path()

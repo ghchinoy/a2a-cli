@@ -114,6 +114,37 @@ func TestSave_AtomicOverwriteKeeps0600(t *testing.T) {
 	}
 }
 
+func TestDelete_RemovesFileAndIsIdempotent(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", dir)
+	if err := Save(&Session{ContextID: "c"}); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "a2a-cli", "session.json")
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("precondition: session should exist: %v", err)
+	}
+	if err := Delete(); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Errorf("session file should be gone, stat err = %v", err)
+	}
+	// Idempotent: deleting a non-existent session is not an error.
+	if err := Delete(); err != nil {
+		t.Errorf("Delete on missing session should be a no-op, got %v", err)
+	}
+}
+
+func TestSanitizeURL_StripsUserinfo(t *testing.T) {
+	if got := SanitizeURL("https://user:token@agent.example/a2a"); got != "https://agent.example/a2a" {
+		t.Errorf("SanitizeURL = %q, want stripped host URL", got)
+	}
+	if got := SanitizeURL(""); got != "" {
+		t.Errorf("SanitizeURL(\"\") = %q, want empty", got)
+	}
+}
+
 func TestDir_UsesXDG(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", "/tmp/xdgtest")
 	dir, err := Dir()
