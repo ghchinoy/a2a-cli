@@ -1,5 +1,8 @@
 # a2a-cli
 
+![status: alpha](https://img.shields.io/badge/status-alpha-orange)
+![license: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue)
+
 A command-line client for talking to [A2A protocol](https://a2a-protocol.org) agents from your
 terminal: send a message to an agent, wait for its answer, and get the result as readable text or
 machine-readable JSON. Built on the official [`a2a-go` v2 SDK](https://github.com/a2aproject/a2a-go).
@@ -9,6 +12,19 @@ machine-readable JSON. Built on the official [`a2a-go` v2 SDK](https://github.co
 > `cancel`, streaming, auth flows) land as later phases complete. The `--output json` shape and the
 > exit-code scheme are a stable contract; everything else may change without notice while the
 > [a2a-cli spec](https://github.com/a2aproject/a2a-cli) is still a Draft.
+
+## Contents
+
+- [Installation](#installation)
+- [Usage](#usage)
+  - [Commands](#commands)
+  - [Global flags](#global-flags)
+  - [Behavior](#behavior)
+  - [Session state](#session-state)
+- [Documentation](#documentation)
+- [Development](#development)
+- [Contributing](#contributing)
+- [License](#license)
 
 ## Installation
 
@@ -119,8 +135,10 @@ stored session → built-in default.
 - **Transport** defaults to HTTP+JSON, chosen from the agent card. An explicit `--transport`
   overrides it; otherwise the card's declared preference is honored. gRPC is not yet supported and
   is rejected with a usage error.
-- **Blocking by default:** `send` waits until the task reaches a terminal state and stops
-  immediately on an interrupted state (`INPUT_REQUIRED` / `AUTH_REQUIRED`).
+- **Blocking by default:** `send` waits until the task reaches a terminal state, and is designed to
+  stop immediately on an interrupted state (`INPUT_REQUIRED` / `AUTH_REQUIRED`). The always-completing
+  sample agent can't exercise the interrupted-stop path yet — see the
+  [test plan](docs/test-plan.md#t6--polling-ac-6).
 - **Output discipline:** in `-o json`, stdout carries only the envelope; all diagnostics go to
   stderr.
 - **Exit codes** (spec §9.5): `0` success · `1` generic failure · `2` usage · `3` unreachable ·

@@ -80,7 +80,9 @@ them back so your next invocation can reuse them.
 ## Text vs JSON
 
 The default output is human-readable **text**. For scripting, switch to **JSON** with `-o json` (or
-its shorthand `-n`):
+its shorthand `-n`). Only `text` and `json` are valid; today an unrecognized value (e.g. `-o yaml`)
+is silently treated as `text` rather than rejected — stricter validation of `--output` is landing
+shortly, so don't rely on the silent fallback.
 
 ```bash
 a2a-cli send "hello" -u http://127.0.0.1:9001 -o json
