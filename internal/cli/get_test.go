@@ -522,6 +522,26 @@ func TestGet_Missing_NotFound_Text(t *testing.T) {
 	}
 }
 
+// §6.3 consistency: a `get` that returns a Task prints a copy-pasteable resume
+// command in text mode, matching `send` (deliverable 4). Locked here so the resume
+// hint stays consistent across the two commands.
+func TestGet_TextMode_PrintsResumeHint(t *testing.T) {
+	cleanConfigDir(t)
+	srv := newTaskServer(t, taskEndpoint{
+		getFn: func(id, _ string) (int, any) {
+			return 200, taskDoc(id, "ctx-1", "TASK_STATE_COMPLETED")
+		},
+	})
+
+	out, errOut, code := runCLI(t, "get", "task-42", "-u", srv.URL)
+	if code != 0 {
+		t.Fatalf("exit = %d, want 0\nstderr: %s", code, errOut)
+	}
+	if !strings.Contains(out, "Resume:") || !strings.Contains(out, "task-42") {
+		t.Errorf("get text output should print a resume command carrying the taskId, got:\n%s", out)
+	}
+}
+
 func TestGet_MissingArg_Usage(t *testing.T) {
 	cleanConfigDir(t)
 	_, errOut, code := runCLI(t, "get", "-u", "http://x")

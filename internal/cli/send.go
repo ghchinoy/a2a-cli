@@ -61,6 +61,32 @@ func runSend(cmd *cobra.Command, args []string) error {
 			sessionDefaults[flagTransport] = sess.Transport
 		}
 	}
+
+	// Resume prior conversation ids ONLY under an explicit --continue/--last (spec
+	// §6.2/§6.4). Resuming is opt-in so a bare `send` never silently attaches to a
+	// stale task; the serviceURL/transport auto-resume above stays unconditional.
+	//   --continue: resume the stored contextId -> a NEW task within the same
+	//               conversation (§6.2: only --context-id starts a new task). Does
+	//               NOT bind the stored taskId.
+	//   --last:     also resume the stored latestTaskId -> the message is sent
+	//               AGAINST that task (§6.2: --task-id continues an existing task,
+	//               e.g. replying to an INPUT_REQUIRED task).
+	// These land in sessionDefaults, so config precedence (explicit flag >
+	// sessionDefault) makes an explicit --context-id/--task-id override the stored
+	// value automatically (§6.4 line 168). Final order: explicit flag >
+	// --continue/--last stored id > session serviceURL/transport default > built-in
+	// default. The no-session error is deferred until the renderer exists (below).
+	resumeContinue := mustBool(flags, flagContinue)
+	resumeLast := mustBool(flags, flagLast)
+	if (resumeContinue || resumeLast) && sess != nil {
+		if sess.ContextID != "" {
+			sessionDefaults[flagContextID] = sess.ContextID
+		}
+		if resumeLast && sess.LatestTaskID != "" {
+			sessionDefaults[flagTaskID] = sess.LatestTaskID
+		}
+	}
+
 	defaults := map[string]string{
 		flagOutput:     "text",
 		flagA2AVersion: client.DefaultA2AVersion,
@@ -79,6 +105,20 @@ func runSend(cmd *cobra.Command, args []string) error {
 	r := render.New(mode, os.Stdout, os.Stderr)
 	if loadErr != nil {
 		r.Warn("WARNING: could not load session: %v", loadErr)
+	}
+
+	// --continue/--last with no stored session is a missing precondition, not a
+	// transport/task failure: report it as a USAGE error (exit 2) — a stderr text
+	// diagnostic in text mode, the Appendix B envelope on stdout in json mode
+	// (usageError routes through the renderer). Exit-code choice flagged for review.
+	if (resumeContinue || resumeLast) && sess == nil {
+		return usageError(r, "no stored session to resume (--continue/--last); run a send first or pass --context-id/--task-id")
+	}
+	// --last with a session that never recorded a task (e.g. the hello-world server
+	// returns a Message, not a Task, so latestTaskId is empty) has nothing to target:
+	// warn on stderr and fall through to a new send rather than fail.
+	if resumeLast && sess != nil && sess.LatestTaskID == "" {
+		r.Warn("WARNING: --last: stored session has no latest task id; sending a new message")
 	}
 
 	serviceURL := cfg.String(flagServiceURL)
