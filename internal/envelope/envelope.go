@@ -53,6 +53,23 @@ type TaskResult struct {
 	History []Message `json:"history,omitempty"`
 }
 
+// SessionView is the normalized, inspectable view of the local session store
+// surfaced by `session show` (spec §6.4: persisted state MUST be inspectable). It
+// is NOT part of the frozen Appendix B task/error contract — it is an
+// inspection-only shape — but it is rendered through the same render seam so the
+// stdout/stderr discipline (§9.1) and terminal sanitization (CO-5) still hold.
+// Path is always present; when no session file exists, Exists is false and the
+// identifier fields are empty.
+type SessionView struct {
+	Path         string `json:"path"`
+	Exists       bool   `json:"exists"`
+	ContextID    string `json:"contextId,omitempty"`
+	LatestTaskID string `json:"latestTaskId,omitempty"`
+	ServiceURL   string `json:"serviceUrl,omitempty"`
+	Transport    string `json:"transport,omitempty"`
+	UpdatedAt    string `json:"updatedAt,omitempty"`
+}
+
 // CLIError is the Appendix B error object — normalized across transports (§9.4).
 type CLIError struct {
 	Code    string `json:"code"`
