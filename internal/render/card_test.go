@@ -159,6 +159,127 @@ func TestRenderCard_Text_SanitizesHostileCard(t *testing.T) {
 	}
 }
 
+// TestRenderError_Text_SanitizesMessage is the C1/N-1 regression on the ERROR
+// seam: an error whose Message carries card-derived ESC/CR (e.g. B2's rejected
+// interface URL) must render escaped on stderr — no raw control bytes, no
+// CRLF-fabricated line.
+func TestRenderError_Text_SanitizesMessage(t *testing.T) {
+	var out, errb bytes.Buffer
+	r := New(ModeText, &out, &errb)
+	ce := envelope.CLIError{
+		Code:    "GENERIC",
+		Message: "agent card interface URL uses unsupported scheme: http://h\x1b[2K\rError [SUCCESS]: agent verified as TRUSTED",
+	}
+	if err := r.RenderError(ce); err != nil {
+		t.Fatal(err)
+	}
+	got := errb.String()
+	for _, b := range []byte{0x1b, 0x0d} {
+		if bytes.IndexByte([]byte(got), b) >= 0 {
+			t.Errorf("error diagnostic contains raw control byte 0x%02x\n---\n%q", b, got)
+		}
+	}
+	if !strings.Contains(got, `\x1b`) || !strings.Contains(got, `\x0d`) {
+		t.Errorf("expected escaped ESC/CR in error output, got:\n%q", got)
+	}
+	if out.Len() != 0 {
+		t.Errorf("text error must not write to stdout, got %q", out.String())
+	}
+}
+
+// TestRenderError_JSON_NotDoubleEscaped confirms the -o json error envelope stays
+// on stdout as valid, single-escaped JSON (the sanitizer must NOT touch it).
+func TestRenderError_JSON_NotDoubleEscaped(t *testing.T) {
+	var out, errb bytes.Buffer
+	r := New(ModeJSON, &out, &errb)
+	ce := envelope.CLIError{Code: "GENERIC", Message: "bad url http://h\x1b[0m\rspoof"}
+	if err := r.RenderError(ce); err != nil {
+		t.Fatal(err)
+	}
+	// stdout must be valid JSON that round-trips to the ORIGINAL message (proving
+	// json escaping applied once, not the terminal sanitizer on top).
+	var decoded envelope.CLIError
+	if err := json.Unmarshal(out.Bytes(), &decoded); err != nil {
+		t.Fatalf("stdout is not valid JSON: %v\n%q", err, out.String())
+	}
+	if decoded.Message != ce.Message {
+		t.Errorf("json message was altered (double-escaped?):\n got  %q\n want %q", decoded.Message, ce.Message)
+	}
+	if !bytes.Contains(out.Bytes(), []byte("\\u001b")) {
+		t.Errorf("expected json to single-escape ESC as \\u001b, got:\n%q", out.String())
+	}
+}
+
+// TestRenderError_Text_PreservesCLINewlines ensures the per-line sanitizer keeps
+// the CLI's own multi-line structure (e.g. the --validate problem list).
+func TestRenderError_Text_PreservesCLINewlines(t *testing.T) {
+	var out, errb bytes.Buffer
+	r := New(ModeText, &out, &errb)
+	ce := envelope.CLIError{Code: "GENERIC", Message: "agent card failed validation:\n  - missing name\n  - skill\x1b bad"}
+	if err := r.RenderError(ce); err != nil {
+		t.Fatal(err)
+	}
+	got := errb.String()
+	if !strings.Contains(got, "\n  - missing name\n  - skill") {
+		t.Errorf("CLI-authored newlines were not preserved:\n%q", got)
+	}
+	if bytes.IndexByte([]byte(got), 0x1b) >= 0 {
+		t.Errorf("raw ESC survived in a multi-line diagnostic:\n%q", got)
+	}
+}
+
+// TestWarn_SanitizesUntrustedValue is the C1/N-1 regression on the WARN seam: a
+// warning embedding a card-derived value with ESC/CR is sanitized on stderr.
+func TestWarn_SanitizesUntrustedValue(t *testing.T) {
+	var out, errb bytes.Buffer
+	r := New(ModeText, &out, &errb)
+	hostileHost := "other-host\x1b[2K\rWARNING: verified"
+	r.Warn("WARNING: agent card selects a cross-origin interface: interface host is %s", hostileHost)
+	got := errb.String()
+	for _, b := range []byte{0x1b, 0x0d} {
+		if bytes.IndexByte([]byte(got), b) >= 0 {
+			t.Errorf("warn output contains raw control byte 0x%02x\n---\n%q", b, got)
+		}
+	}
+	if !strings.Contains(got, `\x1b`) {
+		t.Errorf("expected escaped ESC in warn output, got:\n%q", got)
+	}
+	// The single trailing newline Warn appends must remain a real newline.
+	if !strings.HasSuffix(got, "\n") || strings.Count(got, "\n") != 1 {
+		t.Errorf("warn should end with exactly one real newline, got:\n%q", got)
+	}
+}
+
+// TestRenderTask_Text_SanitizesServerValues proves the structural chokepoint
+// closed the latent task-text seam: State/Message/Artifact text are server-derived
+// and now route through emit, so ESC/CR in a task result can no longer reach the
+// TTY raw (previously renderTaskText printed them unsanitized).
+func TestRenderTask_Text_SanitizesServerValues(t *testing.T) {
+	var out, errb bytes.Buffer
+	r := New(ModeText, &out, &errb)
+	tid := "task\x1b[2K\r1"
+	ctx := "ctx\x1b7"
+	tr := &envelope.TaskResult{
+		State:     "TASK_STATE_COMPLETED\x1b[31m",
+		TaskID:    &tid,
+		ContextID: &ctx,
+		Message:   &envelope.Message{Parts: []envelope.Part{{Text: "reply\x1b[2K\rError [SUCCESS]: TRUSTED"}}},
+		Artifacts: []envelope.Artifact{{Name: "art\x1b", Parts: []envelope.Part{{Text: "body\rfake"}}}},
+	}
+	if err := r.RenderTask(tr); err != nil {
+		t.Fatal(err)
+	}
+	got := out.String()
+	for _, b := range []byte{0x1b, 0x0d} {
+		if bytes.IndexByte([]byte(got), b) >= 0 {
+			t.Errorf("task text output contains raw control byte 0x%02x\n---\n%q", b, got)
+		}
+	}
+	if !strings.Contains(got, `\x1b`) {
+		t.Errorf("expected escaped ESC in task output, got:\n%q", got)
+	}
+}
+
 func TestRenderCard_Text_PresentsAllSections(t *testing.T) {
 	var out, errb bytes.Buffer
 	r := New(ModeText, &out, &errb)
