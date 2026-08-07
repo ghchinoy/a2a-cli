@@ -23,8 +23,11 @@
 
 This Tier-1 conformance report is EVIDENCE-BACKED against the A2A Go hello-world sample servers
 (helloworld/server/jsonrpc and .../rest), exercising the HTTP+JSON REST and JSON-RPC bindings.
-Every Tier-1 MUST is demonstrated with captured per-command evidence (command invoked, request,
-response/exit code).
+Every Tier-1 MUST that the Message-only sample servers can exercise is demonstrated with captured
+per-command evidence (command invoked, request, response/exit code). Surfaces those servers cannot
+drive — exit codes 4–7 (§5), version-unsupported rejection (§4.7), and artifact rendering via
+`--include-artifacts` (§4.10) — are called out explicitly and backed by `go test ./...` unit tests,
+not by live sample-server evidence.
 
 All evidence below is captured verbatim from the compiled CLI run against the two live Go sample
 servers on loopback. Wire-level requests (headers on the wire) were captured with a raw TCP
@@ -55,7 +58,7 @@ output for each is reproduced in §4.1–§4.9.
 | # | Acceptance criterion (design §10) | Transport(s) | Observed | Verdict |
 |---|---|---|---|---|
 | 1 | Defaults: HTTP+JSON via card selection; `send` blocks to terminal by default; minimal `text` output; TLS on; latest version signaled | REST + JSON-RPC | Card-declared transport selected and echoed; blocking `send` returns `TASK_STATE_COMPLETED`; default output is labeled `text`; `A2a-Version: 1.0` on every request (§4.7) | **PASS** |
-| 2 | Commands `discover`/`send`/`get`/`cancel` behave per spec (incl. `--history`) | REST + JSON-RPC | All four exercised against both servers; `--history` clamp honored (§4.6) | **PASS** |
+| 2 | Commands `discover`/`send`/`get`/`cancel` behave per spec (incl. `--history`, `--include-artifacts`) | REST + JSON-RPC | All four exercised against both servers; `--history` clamp honored (§4.6). Artifact rendering (`--include-artifacts`) is **not server-reproducible** here — the Message-only sample emits no artifacts — so it is unit-tested, not claimed as live evidence (§4.10) | **PASS** — `--include-artifacts` unit-tested; not server-reproducible (§4.10) |
 | 3 | Envelope (Appendix B): `taskId`/`contextId`/`state` in `-o json`; errors `{code,message,a2aCode}`; identical error codes across bindings; JSON only on stdout | REST + JSON-RPC | Envelope emitted with the required fields; `NOT_FOUND` error object identical on both bindings (§4.3, §4.5) | **PASS** |
 | 4 | Exit codes 0–7 correct for their triggers | REST + JSON-RPC | 0/1/2/3 demonstrated live against both servers (§5); 4–7 are unit-test-backed (see §5 note) | **PASS** |
 | 5 | Conversation/session: identifiers never fabricated; captured/replayed; `--continue`/`--last`; no memory-only state | REST + JSON-RPC | `taskId`/`contextId` surfaced as `null` (never invented) because the sample returns a Message; session persisted to disk and reused by `--continue`; `--last` honestly warns when no task id was stored (§4.5) | **PASS** |
@@ -371,6 +374,28 @@ $ find . -name SKILL.md -not -path './.git/*' | wc -l
 
 Exactly one `SKILL.md` ships. `plugin.json` bundles it via `"skills": "./skill/"` for
 self-installation following the agent-plugins convention (§12.3).
+
+### 4.10 artifact rendering (`--include-artifacts`) — not server-reproducible (AC2)
+
+Rendering produced artifacts is a Tier-1 **MUST** (spec §2: "a conformant tool MUST render
+Artifacts"; §8.2 "The tool MUST render produced artifacts"; §8.3 `get … state, artifacts
+(--include-artifacts)`), and design §10 AC2 lists `--include-artifacts` explicitly. Artifacts are a
+**Task** output: the hello-world executor yields a bare **Message**, not a Task, so it emits **no
+artifacts** on any binding (JSON-RPC or REST). `--include-artifacts` therefore has nothing to render
+against these sample servers and **cannot** be exercised as live evidence here — the same
+sample-server limitation that keeps exit codes 4–7 (§5) and version-unsupported rejection (§4.7)
+from being reproduced live.
+
+The `--include-artifacts` render path is instead validated by unit tests in the green
+`go test ./...` suite (§7): `TestGet_IncludeArtifacts` and `TestGet_IncludeArtifacts_TextMode`
+(`internal/cli/get_test.go`) assert that with the flag the full artifact contents are rendered — in
+`-o json` and in text mode respectively — and that without it artifacts are summarized. For streamed
+artifacts, `TestRenderStreamEvent_SanitizesHostileContent` (`internal/render/stream_render_test.go`)
+renders an artifact event's parts through the stream renderer in both text and NDJSON modes (its
+primary assertion is control-byte sanitization), and `TestApplyStreamEvent_ArtifactAppend`
+(`internal/client/stream_test.go`) covers streamed-artifact accumulation (each `artifactUpdate`
+appends rather than replaces). This is a limitation of the Message-only sample server, not an
+unimplemented code path.
 
 ---
 
