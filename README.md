@@ -12,8 +12,9 @@ result as readable text or machine-readable JSON. Built on the official
 > set is merged — **`send`**, **`discover`**, **`get`**, **`cancel`**, and **`session`** — over the
 > **HTTP+JSON** and **JSON-RPC** transports, including caller-supplied authentication and
 > card-gated SSE streaming (`send --stream`). A bundled agent skill and self-installable plugin ship
-> in the repo ([`skill/SKILL.md`](skill/SKILL.md), [`plugin.json`](plugin.json)). gRPC and the Tier-1
-> conformance report are still to come. The `--output json` shape and the exit-code scheme
+> in the repo ([`skill/SKILL.md`](skill/SKILL.md), [`plugin.json`](plugin.json)). A Tier-1 conformance
+> report is published — see [`docs/compliance/tier-1-conformance.md`](docs/compliance/tier-1-conformance.md);
+> gRPC is still to come. The `--output json` shape and the exit-code scheme
 > are a stable contract; everything else may change without notice while the
 > [a2a-cli spec](https://github.com/a2aproject/a2a-cli) is still a Draft.
 
@@ -256,11 +257,12 @@ Explicit flags and environment variables always override stored values.
 - [User guide](docs/user-guide.md) — install, quickstart, and worked examples for every command.
 - [Test plan](docs/test-plan.md) — validation and Tier-1 conformance walkthrough for reviewers and
   the conformance team.
+- [Tier-1 conformance report](docs/compliance/tier-1-conformance.md) — the project's own Tier-1
+  conformance report for reviewers and the conformance team. The external Python TCK is deferred to
+  Tier 2.
 - [Changelog](CHANGELOG.md) — notable changes, curated per release.
 - [Agent skill](skill/SKILL.md) — a bundled, generic skill that teaches an agent to drive the CLI
   non-interactively, packaged as a self-installable plugin via [`plugin.json`](plugin.json).
-
-The Tier-1 compliance report is coming in a later phase and will be linked here when it lands.
 
 ## Development
 

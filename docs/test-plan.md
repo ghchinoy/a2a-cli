@@ -2,27 +2,32 @@
 
 This is the validation walkthrough for experienced users and the conformance team. It maps runnable
 command sequences to the design's **§10 Tier-1 acceptance criteria (AC)** and to the **§13
-compliance-report** notion, so the team can execute it end to end at Phase 8 and record evidence.
+compliance-report** notion, so the team can execute it end to end and record evidence in the Tier-1
+conformance report.
 
 The plan is intentionally comprehensive — it enumerates the full Tier-1 acceptance surface. Each
 step is clearly marked as either:
 
-- **✅ Exercisable now** — runnable against the current merged build (Phases 1–6). Expected output
-  below was captured from the built binary run against the live Go hello-world sample servers (REST
-  and JSON-RPC).
+- **✅ Exercisable now** — runnable against the current merged build (the full Tier-1 surface,
+  Phases 1–8). Expected output below was captured from the built binary run against the live Go
+  hello-world sample servers (REST and JSON-RPC).
 - **◑ Partial** — the command is merged and exercisable, but some facet of the criterion needs a
-  richer server (task-producing, auth-enforcing, or multi-version) that Tier-1 CI doesn't provision.
-- **⏳ Pending** — the criterion is specified but the code that satisfies it is not merged yet; the
-  step names the phase (per design §9) that unlocks it.
+  richer server (task-producing, auth-enforcing, or multi-version) that Tier-1 CI doesn't provision;
+  the underlying code path is merged and unit-tested.
+- **⏳ Deferred** — live validation of the facet is deferred to the Tier-2 fixture (the Python
+  multi-transport / auth-enforcing server) per design §7 Q5; the Tier-1 code path is merged and
+  unit-tested where applicable. (No Tier-1 code remains unmerged.)
 
-> **Merged surface at time of writing.** Phases 1–6 are on `main`: `send` (with `--stream`),
+> **Merged surface.** The full Tier-1 surface (Phases 1–8) is on `main`: `send` (with `--stream`),
 > `discover` (full card presentation, `--card-url`, `--validate`, surfaced card-driven transport
 > selection), `get` (`--include-artifacts`, `--history`, `--wait`/`--watch`), `cancel`, and the
 > `session` command (`show` / `clear`); card-driven transport selection over **HTTP+JSON and
 > JSON-RPC**; the JSON envelope + cross-binding error normalization; exit-code mapping; blocking
 > wait; `--continue` / `--last` continuation; caller-supplied auth with the cross-origin/downgrade
 > credential gate; `A2A-Version` signaling; and session capture (`0600`). The `SKILL.md` bundle
-> (Phase 7) and the TCK-backed compliance report (Phase 8) are not yet merged.
+> (Phase 7) and the Tier-1 conformance report (Phase 8) are also merged — see the [Tier-1 conformance
+> report](compliance/tier-1-conformance.md). That report is the project's own Tier-1 conformance
+> report; the external Python TCK is **not** run at Tier 1 and remains deferred to Tier 2.
 
 ## Contents
 
@@ -130,9 +135,9 @@ minimal structured text (labeled fields, not raw JSON), and used HTTP+JSON — t
 card advertises. Protocol version defaults to `1.0` (see T7).
 
 - ✅ HTTP+JSON default, blocking-by-default, text-default, TLS-on default — verified here.
-- ⏳ Blocking **stop on interrupted state** (`INPUT_REQUIRED`/`AUTH_REQUIRED`) cannot be shown with
-  this always-completing agent; validate with a task-producing server once `get`/continuation land
-  (Phases 3–4).
+- ◑ Blocking **stop on interrupted state** (`INPUT_REQUIRED`/`AUTH_REQUIRED`) cannot be shown with
+  this always-completing agent; the stop logic is merged and unit-tested, and live validation needs
+  a task-producing server (Tier-2 fixture).
 
 ### T2 — Commands (AC 2)
 
@@ -238,7 +243,8 @@ a2a-cli get some-task-id -u http://127.0.0.1:9001 --history 99999   # -> stderr:
 
 `--include-artifacts` (fetch artifact contents vs the default summary), `--wait`/`--watch` (poll to a
 terminal/interrupted state, reusing the same loop as `send`), and `--poll-interval`/`--timeout` are
-all accepted (`a2a-cli get --help`).
+all accepted (`a2a-cli get --help`). The `--include-artifacts` rendering itself is **unit-tested**,
+not exercised here — the Go hello-world servers emit a message with no artifacts to fetch.
 
 **✅ Exercisable now — `cancel` (Phase 3):** `cancel <taskId>` is idempotent and reports the
 resulting state; a successful cancel exits `0`. Against the store-less servers an unknown id
@@ -254,8 +260,9 @@ a2a-cli cancel some-task-id -u http://127.0.0.1:9001
 - ✅ `get`/`cancel` present, flag surface, and the `NOT_FOUND` normalization (identical over HTTP+JSON
   **and** JSON-RPC — point either command at `http://127.0.0.1:9002`) — verified.
 - ◑ `get` against a **real** task (state/artifacts/history rendering), `get --wait` polling to
-  terminal, and `cancel` moving a live task to `CANCELED` need a **task-producing** server; the Go
-  hello-world servers reply with a message and keep no task store.
+  terminal, and `cancel` moving a live task to `CANCELED` are **unit-tested** and need a
+  **task-producing** server for live validation; the Go hello-world servers reply with a message and
+  keep no task store.
 - ⏳ `discover` against a **multi-interface** card (preference ordering, routing identifier) needs the
   Tier-2 Python fixture — the hello-world cards each declare a single interface.
 
@@ -346,8 +353,8 @@ a2a-cli get missing -u http://127.0.0.1:9002 -o json | jq -c '{code,a2aCode}'   
 - ✅ Cross-**binding** identical error codes — verified across the two live Go bindings (HTTP+JSON and
   JSON-RPC) for the `NOT_FOUND` case. gRPC is out of scope (not supported); broader cross-binding
   coverage across every error awaits the Tier-2 multi-transport fixture.
-- ◑ `artifacts` array population needs an artifact-producing server; the Go hello-world servers emit
-  a message with no artifacts.
+- ◑ `artifacts` array population is **unit-tested**, not exercisable here; it needs an
+  artifact-producing server — the Go hello-world servers emit a message with no artifacts.
 
 ### T4 — Exit codes (AC 4)
 
@@ -446,14 +453,14 @@ a2a-cli session show                              # path + contextId/latestTaskI
 a2a-cli session clear                             # -> session cleared: <path>
 ```
 
-**⏳ Pending:**
+**⏳ Deferred (fixture / Tier-2):**
 
 - **Full continuation replay** against a **task-aware** server (a real `contextId`/`taskId` echoed
   back and replayed on the next turn) — the Go hello-world servers reply with a message and open no
   task, so there is no live task to continue. The `--task-id` not-found guard above is verified; the
-  positive replay path needs a richer server.
+  positive replay path is unit-tested and its live validation needs a task-producing server.
 - **Resume-command hint** on **interruption** (`INPUT_REQUIRED` → `a2a-cli send --task-id <id>
-  "<reply>"`) — needs an interruptible task; the hint code path is unit-tested.
+  "<reply>"`) — needs an interruptible task; the hint code path is merged and unit-tested.
 - **`0600` secret file** for persisted credentials — Tier 1 does not persist caller-supplied creds;
   the mode-restricted `credentials.json` is a Tier-2 concern. The `session.json` store is already
   `0600` (verified above).
@@ -510,9 +517,10 @@ JSON-RPC card it reports `Selected transport: jsonrpc -> http://127.0.0.1:9002/i
 value is sent on every request. The Go hello-world server logs only method, path, and body — **not
 headers** — so confirming the `A2A-Version` header on the wire requires a header-inspecting proxy
 (e.g. `mitmproxy`) or `tcpdump` in front of the agent. The signaling logic is implemented and
-unit-tested in `internal/client`.
+unit-tested in `internal/client`; the version-signaling evidence is recorded in the [Tier-1
+conformance report](compliance/tier-1-conformance.md).
 
-**◑ Partial / ⏳ Pending:** honoring a multi-interface **preference order** and echoing a **routing
+**◑ Partial / ⏳ Deferred:** honoring a multi-interface **preference order** and echoing a **routing
 identifier** need a single card that declares several interfaces — each Go card declares one, so
 cross-transport parity is checked by pointing at the two servers rather than by one multi-interface
 card. Surfacing a clear **version-unsupported** error (exit `1`, `a2aCode` `VERSION_NOT_SUPPORTED`,
@@ -533,8 +541,10 @@ a2a-cli send "hi" -u http://127.0.0.1:9001 --bearer TESTTOKEN -H "X-Tenant: acme
 The hello-world server requires no auth, so this succeeds (exit `0`) but does not prove attachment.
 The Go sample server logs only method, path, and body — **not headers** — so confirming
 `Authorization: Bearer TESTTOKEN` / `X-Tenant: acme` / `X-API-Key` on the wire requires a
-header-inspecting proxy (e.g. `mitmproxy`) or `tcpdump`. Env equivalents (`A2A_CLI_BEARER`,
-`A2A_CLI_API_KEY`) feed the same path. Credential construction is unit-tested in `internal/client`.
+header-inspecting proxy (e.g. `mitmproxy`) or `tcpdump`. Env equivalents (`A2A_BEARER`,
+`A2A_API_KEY` — note: **not** the `A2A_CLI_`-prefixed config variables) feed the same path.
+Credential construction is unit-tested in `internal/client`; the credential-attachment evidence is
+recorded in the [Tier-1 conformance report](compliance/tier-1-conformance.md).
 
 **✅ Exercisable now — cross-origin/downgrade credential gate (Phase 6, CO-7):** credentials attach
 per request to a same-origin target, but are **withheld** from a cross-origin or downgraded
@@ -543,7 +553,7 @@ carries credentials. Against the Go servers the selected interface is same-origi
 creds attach silently and the flag is a no-op — the withhold/opt-in decision and its warnings are
 unit-tested (`internal/client`). The flag is present (`a2a-cli --help`) and defaults off.
 
-**⏳ Pending:** full validation against an **auth-enforcing** agent (correct 401 → exit `4` on bad
+**⏳ Deferred:** full validation against an **auth-enforcing** agent (correct 401 → exit `4` on bad
 creds, success on good creds) and a **cross-origin card** (to trigger the withhold warning live) both
 need a richer fixture than the no-auth, single-origin Go servers.
 
@@ -552,38 +562,47 @@ need a richer fixture than the no-auth, single-origin Go servers.
 **Criterion:** exactly one generic `SKILL.md`; defers to `--help`; no normative restatement;
 installable via `plugin.json` (design §10.9, spec §12).
 
-**⏳ Pending — Phase 7.** No `SKILL.md` or `plugin.json` is merged yet. Confirm absence:
+**✅ Exercisable now (Phase 7):** exactly one `SKILL.md` ships, bundled for self-installation via
+`plugin.json`:
 
 ```bash
-ls SKILL.md skill/ plugin.json 2>&1   # expected: no such file(s)
+find . -name SKILL.md -not -path './.git/*'          # -> ./skill/SKILL.md
+find . -name SKILL.md -not -path './.git/*' | wc -l  # -> 1
 ```
 
-Re-run this check when Phase 7 lands: assert exactly one skill file exists, it contains no full
-command enumeration, and it restates no normative requirements.
+The bundled [`skill/SKILL.md`](../skill/SKILL.md) defers to `a2a-cli help` / `a2a-cli <command>
+--help` rather than enumerating the command surface or restating normative requirements, and
+[`plugin.json`](../plugin.json) references `./skill/` so the skill installs with the plugin.
 
 ### T10 — Compliance report (AC 10)
 
-**Criterion:** a Tier-1 compliance report is published, TCK-backed, advertising no untested tier
-(design §10.10, spec §13). **⏳ Pending — Phase 8.** See the next section.
+**Criterion:** a Tier-1 compliance report is published, advertising no untested tier (design §10.10,
+spec §13). Design originally envisioned a TCK-backed report; per the resolved scope decision (§7 Q5)
+the external Python TCK is deferred to Tier 2, so the Tier-1 report is the project's own conformance
+report and makes no TCK-version claim.
+
+**✅ Published (Phase 7–8):** the report is merged at
+[`docs/compliance/tier-1-conformance.md`](compliance/tier-1-conformance.md). See
+[the next section](#the-13-compliance-report).
 
 ## Acceptance-criteria coverage matrix
 
 Mapping design §10 Tier-1 acceptance criteria to this plan and to the current merged build:
 
-| AC (design §10) | Test | Status against merged build (Phases 1–6) | Remaining work needs |
+| AC (design §10) | Test | Status against merged build (Phases 1–8) | Remaining work needs |
 |---|---|---|---|
 | 1 — Defaults (§4.5) | [T1](#t1--defaults-ac-1) | ◑ Partial — HTTP+JSON / blocking / text / TLS / v1.0 verified; interrupted-stop needs a task server | Task-producing server |
 | 2 — Commands `discover`/`send`/`get`/`cancel` (§8.1–8.4) | [T2](#t2--commands-ac-2) | ◑ Partial — all four commands + `session` merged; `send`/`discover`/`get`/`cancel` surface & `NOT_FOUND` verified over both bindings; real-task `get`/`cancel` need a task server | Task-producing server |
-| 3 — JSON envelope (Appendix B, §9.3) | [T3](#t3--json-envelope-ac-3) | ◑ Partial — success + error envelope, stdout/stderr, NDJSON stream, and cross-binding `NOT_FOUND` equality verified; artifact population pending | Artifact-producing server |
+| 3 — JSON envelope (Appendix B, §9.3) | [T3](#t3--json-envelope-ac-3) | ◑ Partial — success + error envelope, stdout/stderr, NDJSON stream, and cross-binding `NOT_FOUND` equality verified; artifact rendering unit-tested | Artifact-producing server |
 | 4 — Exit codes 0–7 (§9.5) | [T4](#t4--exit-codes-ac-4) | ◑ Partial — 0/1/2/3 verified end to end; 4/5/6/7 mapped + unit-tested | Auth-enforcing / task server |
 | 5 — Conversation/session (§6) | [T5](#t5--conversation--session-ac-5) | ◑ Partial — capture/replay, report-back, `--continue`/`--last`, `session` show/clear, `0600`, and `--task-id` not-found guard verified; positive replay + interruption hint pending | Task-producing server |
 | 6 — Polling (§7) | [T6](#t6--polling-ac-6) | ◑ Partial — flags, `get --wait`/`--watch`, and `send --stream` reconcile/fallback merged; terminal-wait verified; interrupted-stop/timeout/SIGINT/forced-drop pending | Long-running / task server |
 | 7 — Transport & version (§11) | [T7](#t7--transport--version-ac-7) | ◑ Partial — card-driven selection + override over **HTTP+JSON and JSON-RPC** + v1.0 signaling verified; multi-interface preference/routing id/version-error pending | Multi-interface / version-strict server |
 | 8 — Auth (§10.1) | [T8](#t8--auth-ac-8) | ◑ Partial — flags/headers + cross-origin credential gate built & unit-tested; live enforcement pending | Auth-enforcing / cross-origin server |
-| 9 — SKILL.md (§12) | [T9](#t9--skillmd-ac-9) | ✗ Not merged | Phase 7 |
-| 10 — Compliance report (§13) | [T10](#t10--compliance-report-ac-10) | ✗ Not merged | Phase 8 |
+| 9 — SKILL.md (§12) | [T9](#t9--skillmd-ac-9) | ✅ — one `SKILL.md`, bundled via `plugin.json` | — |
+| 10 — Compliance report (§13) | [T10](#t10--compliance-report-ac-10) | ✅ — [report published](compliance/tier-1-conformance.md); Python TCK deferred to Tier 2 | Tier-2 TCK |
 
-Legend: ✅ full · ◑ partial · ✗ not present.
+Legend: ✅ full · ◑ partial.
 
 The predominant `◑ Partial` reflects a **complete, verified command surface** whose remaining gaps
 are almost all one thing: the Go hello-world servers reply with a message and keep no task store, so
@@ -592,22 +611,28 @@ multi-transport fixture (and an auth-enforcing server), per design §7 Q5 — no
 
 ## The §13 compliance report
 
-At **Phase 8**, the team produces the Tier-1 compliance report that substantiates the advertised
-tier (spec §13, design §9 Phase 8 / §10.10). This plan is the manual validation input to it. The
-report must state:
+The Tier-1 conformance report is published at
+[`docs/compliance/tier-1-conformance.md`](compliance/tier-1-conformance.md) (spec §13, design §9
+Phase 8 / §10.10). It substantiates the advertised tier, and this plan is the manual-validation
+input that feeds it. The report states:
 
 - the **tier claimed** (Tier 1) and that **no untested tier** is advertised;
-- **per-command pass/fail** for `discover`, `send`, `get`, `cancel`;
-- the **A2A TCK version(s)** exercised — the TCK `--level must` subset run against a live sample
-  server (design §8; the TCK requires Python 3.11+/`uv`, provisioned at Tier 2 per §7 Q5);
-- **transports covered** — HTTP+JSON at Tier 1;
-- conformance to the **conversation/session (§6)** and **polling (§7)** requirements.
+- **per-command results** for `discover`, `send`, `get`, `cancel`;
+- **transports covered** — HTTP+JSON (REST + JSON-RPC) at Tier 1;
+- conformance to the **conversation/session (§6)** and **polling (§7)** requirements, within the
+  limits of the sample-server fixture.
 
-With Phases 1–6 merged, the per-command surface (`discover`, `send`, `get`, `cancel`) is exercisable
-over both HTTP+JSON and JSON-RPC, and the coverage matrix above is the interim record of what has
-been validated against live Go servers. The TCK-backed rows (per-command pass/fail under the TCK,
-TCK version, §6/§7 conformance against task-producing states) still await Phases 7–8 and the Tier-2
-Python fixture; the compliance report itself is produced at Phase 8.
+**On the TCK.** Design §8 originally envisioned the A2A TCK (`--level must`) run against a live
+sample server. Per the resolved scope decision (§7 Q5), the **external Python A2A TCK is not run at
+Tier 1** and is **deferred to Tier 2** (which adds the opt-in Python 3.11+/`uv` job and
+multi-transport/gRPC coverage). The Tier-1 report is therefore the **project's own Tier-1 conformance
+report** and makes **no TCK-version claim** — do not read this plan as asserting one.
+
+The per-command surface (`discover`, `send`, `get`, `cancel`) is exercisable over both HTTP+JSON and
+JSON-RPC, and the coverage matrix above is the manual-validation record this plan contributes. The
+facets that need task-producing states, artifacts, or auth enforcement remain unit-tested at Tier 1
+and await the Tier-2 Python fixture; see the
+[Tier-1 conformance report](compliance/tier-1-conformance.md) for the consolidated result.
 
 ## Items of concern
 

@@ -11,7 +11,8 @@ through the options that matter day to day.
 > was captured from the built binary run against a live Go sample server. A few behaviors that need
 > a richer fixture — auth enforcement, protocol-version negotiation, cross-origin credential
 > handling, and exit codes 4–7 — are described from the spec and implementation (unit-tested) and
-> are tracked in the [test plan](test-plan.md).
+> are tracked in the [test plan](test-plan.md); see also the [Tier-1 conformance
+> report](compliance/tier-1-conformance.md).
 
 ## Contents
 
@@ -584,7 +585,9 @@ Add `-v` for extra diagnostics on stderr while debugging.
 
 The Tier-1 command surface is complete, and a bundled, self-installable agent skill now ships in the
 repo ([`skill/SKILL.md`](../skill/SKILL.md), packaged as a plugin via [`plugin.json`](../plugin.json)).
-Still to land: the Tier-1 conformance report, plus richer validation against an auth-enforcing and
-multi-transport server. Beyond Tier 1, gRPC transport and interactive OAuth login are planned. This
+The Tier-1 conformance report is published — see the [Tier-1 conformance
+report](compliance/tier-1-conformance.md). Still to land: richer validation against an auth-enforcing
+and multi-transport server (the Tier-2 Python fixture). Beyond Tier 1, gRPC transport and interactive
+OAuth login are planned. This
 guide will be extended as each merges. Until then, treat any behavior not documented here as not yet
 available. Run `a2a-cli --help` or `a2a-cli <command> --help` to see the current surface at any time.

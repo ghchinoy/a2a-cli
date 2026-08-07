@@ -21,6 +21,10 @@ _No release has been tagged yet; the Tier-1 command surface is merged and the pr
 - **Deterministic exit-code scheme** (spec §9.5) mapping outcomes to stable process exit codes: `0` success, `1` failure, `2` usage, `3` unreachable, `4` auth, `5` task failed, `6` input required, `7` timeout. [#1]
 - **Bundled agent skill and self-installable plugin** — [`skill/SKILL.md`](skill/SKILL.md) teaches an agent to drive the CLI non-interactively, packaged as a Claude Code plugin via [`plugin.json`](plugin.json). [#10]
 
+### Documentation
+
+- **Tier-1 conformance report** — a Tier-1 conformance report is published at [`docs/compliance/tier-1-conformance.md`](docs/compliance/tier-1-conformance.md), cross-linked from the README, user guide, and test plan as the Tier-1 evidence artifact; the external Python TCK remains deferred to Tier 2. [#14]
+
 ### Security
 
 - Caller credentials are withheld from cross-origin or downgraded (`https`→`http`) targets by default and attached only per matching request; opt in with `--allow-cross-origin-credentials`. The agent-card fetch never carries credentials. [#9]
@@ -36,3 +40,4 @@ _No release has been tagged yet; the Tier-1 command surface is merged and the pr
 [#8]: https://github.com/ghchinoy/a2a-cli/pull/8
 [#9]: https://github.com/ghchinoy/a2a-cli/pull/9
 [#10]: https://github.com/ghchinoy/a2a-cli/pull/10
+[#14]: https://github.com/ghchinoy/a2a-cli/pull/14
