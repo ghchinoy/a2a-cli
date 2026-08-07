@@ -12,11 +12,17 @@
 package cli
 
 import (
+	"errors"
+	"os"
+	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 
 	"github.com/ghchinoy/a2a-cli/internal/clierr"
+	"github.com/ghchinoy/a2a-cli/internal/envelope"
+	"github.com/ghchinoy/a2a-cli/internal/render"
 )
 
 // Global flag names (spec §5.2). Kept as constants so config keys and flag names
@@ -78,6 +84,46 @@ func NewRootCommand() *cobra.Command {
 }
 
 // Execute builds and runs the root command, returning the error for exit mapping.
+//
+// Errors raised before a command builds its own render.Renderer — cobra-level
+// usage errors such as an unknown flag or the wrong argument count — would
+// otherwise exit non-zero while printing nothing to either stream (spec §9.1/§9.4).
+// Any returned error that has not already been rendered is surfaced here through a
+// default renderer (mode inferred from -o/-n, defaulting to text): json mode emits
+// the Appendix B {code,message,a2aCode} object on stdout, text mode a stderr
+// diagnostic. The exit-code mapping stays the single tail in main.
 func Execute() error {
-	return NewRootCommand().Execute()
+	root := NewRootCommand()
+	err := root.Execute()
+	if err != nil {
+		renderTopLevelError(root.Flags(), err)
+	}
+	return err
+}
+
+// renderTopLevelError surfaces an error that no command renderer has handled yet.
+func renderTopLevelError(flags *pflag.FlagSet, err error) {
+	var ce *clierr.Error
+	if errors.As(err, &ce) && ce.Rendered() {
+		return // already surfaced by the command that produced it
+	}
+	r := render.New(modeFromFlags(flags), os.Stdout, os.Stderr)
+	if errors.As(err, &ce) {
+		_ = r.RenderError(ce.ToEnvelope())
+		return
+	}
+	_ = r.RenderError(envelope.CLIError{Code: string(clierr.KindGeneric), Message: err.Error()})
+}
+
+// modeFromFlags infers the output mode from -n/--no-tui and -o/--output. On a
+// flag-parse error the flag set may be only partially parsed; unresolved flags
+// fall back to their defaults, i.e. text mode.
+func modeFromFlags(flags *pflag.FlagSet) render.Mode {
+	if b, err := flags.GetBool(flagNoTUI); err == nil && b {
+		return render.ModeJSON
+	}
+	if o, err := flags.GetString(flagOutput); err == nil && strings.EqualFold(o, "json") {
+		return render.ModeJSON
+	}
+	return render.ModeText
 }

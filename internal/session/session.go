@@ -13,6 +13,7 @@ package session
 
 import (
 	"encoding/json"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -66,9 +67,17 @@ func Path() (string, error) {
 
 // Save writes the session to disk, creating the config dir (0700) and writing the
 // file with 0600 permissions (spec §6.4: secret-capable files are owner-only).
+//
+// The write is atomic (temp file in the same dir + rename) so a crash or a
+// concurrent run cannot leave a truncated session.json, and 0600 is enforced
+// explicitly even when the file/dir already exists with looser permissions
+// (audit L-3). Any credentials embedded in the service URL are stripped before
+// persistence (audit L-1) — Tier 1 persists no caller-supplied secrets.
 func Save(s *Session) error {
 	s.SchemaVersion = SchemaVersion
 	s.UpdatedAt = time.Now().UTC()
+	s.ServiceURL = sanitizeURL(s.ServiceURL)
+
 	dir, err := Dir()
 	if err != nil {
 		return err
@@ -80,7 +89,48 @@ func Save(s *Session) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(filepath.Join(dir, fileName), data, 0o600)
+
+	final := filepath.Join(dir, fileName)
+	tmp, err := os.CreateTemp(dir, ".session-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName) // no-op after a successful rename
+	if err := tmp.Chmod(0o600); err != nil {
+		tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpName, final); err != nil {
+		return err
+	}
+	// Enforce 0600 in case the destination pre-existed with looser perms.
+	return os.Chmod(final, 0o600)
+}
+
+// sanitizeURL removes any userinfo (user:password@) from a URL so URL-embedded
+// credentials are never written to disk. Unparseable input is returned unchanged.
+func sanitizeURL(s string) string {
+	if s == "" {
+		return s
+	}
+	u, err := url.Parse(s)
+	if err != nil {
+		return s
+	}
+	u.User = nil
+	return u.String()
 }
 
 // Load reads the session from disk. It returns (nil, nil) when no session exists.

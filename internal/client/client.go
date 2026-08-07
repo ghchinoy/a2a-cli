@@ -18,6 +18,8 @@ import (
 	"errors"
 	"net"
 	"net/http"
+	"net/url"
+	"time"
 
 	"github.com/a2aproject/a2a-go/v2/a2a"
 	"github.com/a2aproject/a2a-go/v2/a2aclient"
@@ -32,6 +34,15 @@ import (
 // legacy 0.3 (findings §B.7).
 const DefaultA2AVersion = "1.0"
 
+// Default HTTP deadlines bound card fetch/connect/send against a slow or hostile
+// server even when --timeout is not set (audit M-1). --timeout, when > 0, bounds
+// the whole operation more tightly via context deadlines.
+const (
+	defaultHTTPTimeout           = 30 * time.Second
+	defaultTLSHandshakeTimeout   = 10 * time.Second
+	defaultResponseHeaderTimeout = 30 * time.Second
+)
+
 // Options configures a Client.
 type Options struct {
 	ServiceURL string             // base URL of the agent
@@ -39,6 +50,7 @@ type Options struct {
 	Transport  string             // "", "http-json", "jsonrpc", "grpc"
 	A2AVersion string             // protocol version to signal; defaults to "1.0"
 	Insecure   bool               // skip TLS verification (emits a warning)
+	Timeout    time.Duration      // overall per-operation deadline (0 = default only)
 	Creds      CredentialProvider // per-request credential seam
 	Warnf      func(string, ...any)
 }
@@ -50,6 +62,7 @@ type Client struct {
 	transport string
 	url       string
 	version   string
+	timeout   time.Duration
 }
 
 func (o Options) warnf(format string, args ...any) {
@@ -66,10 +79,28 @@ func New(ctx context.Context, opts Options) (*Client, error) {
 		version = DefaultA2AVersion
 	}
 
-	httpClient := &http.Client{}
+	// Bound card fetch/connect/send even without --timeout: the shared client gets
+	// an overall timeout and the transport handshake/response-header deadlines, so
+	// a slow or hostile server cannot hang the CLI indefinitely (audit M-1). TLS
+	// verification stays on unless --insecure is set, and only on this transport.
+	transport := &http.Transport{
+		TLSHandshakeTimeout:   defaultTLSHandshakeTimeout,
+		ResponseHeaderTimeout: defaultResponseHeaderTimeout,
+	}
 	if opts.Insecure {
 		opts.warnf("WARNING: TLS certificate verification is disabled (--insecure)")
-		httpClient.Transport = &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}
+		transport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
+	}
+	httpClient := &http.Client{
+		Timeout:   defaultHTTPTimeout,
+		Transport: transport,
+	}
+
+	// When --timeout is set, bound the card-fetch/connect phase on the context too.
+	if opts.Timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, opts.Timeout)
+		defer cancel()
 	}
 
 	card, err := resolveCard(ctx, opts, version, httpClient)
@@ -86,10 +117,13 @@ func New(ctx context.Context, opts Options) (*Client, error) {
 	// request (spec §11.2). This guarantees a non-empty value.
 	iface.ProtocolVersion = a2a.ProtocolVersion(version)
 
-	factoryOpts := []a2aclient.FactoryOption{
-		a2aclient.WithJSONRPCTransport(httpClient),
-		a2aclient.WithRESTTransport(httpClient),
-	}
+	// Register the JSONRPC and REST transports (backed by httpClient so the
+	// timeouts and --insecure config above apply) at the requested version — not
+	// only the SDK's built-in 1.0. Without this the SDK matches by major version
+	// and normalizes the data-plane A2A-Version back to "1.0", silently discarding
+	// a --a2a-version override on send/get. Registering an exact-version key makes
+	// the version the user signals the one actually sent on every request (AC#5).
+	factoryOpts := transportFactoryOptions(a2a.ProtocolVersion(version), httpClient)
 	if opts.Creds != nil {
 		factoryOpts = append(factoryOpts, a2aclient.WithCallInterceptors(&authInterceptor{
 			provider: opts.Creds,
@@ -108,7 +142,30 @@ func New(ctx context.Context, opts Options) (*Client, error) {
 		transport: transportName,
 		url:       iface.URL,
 		version:   version,
+		timeout:   opts.Timeout,
 	}, nil
+}
+
+// transportFactoryOptions registers the Tier-1 transports (JSONRPC + HTTP+JSON)
+// for the given protocol version, backed by httpClient. Registering at the
+// requested version (rather than relying on the SDK's default 1.0 registration
+// and its major-version compatibility fallback) ensures the A2A-Version the SDK
+// sends on the data plane matches what the user requested via --a2a-version.
+func transportFactoryOptions(version a2a.ProtocolVersion, httpClient *http.Client) []a2aclient.FactoryOption {
+	jsonrpc := a2aclient.TransportFactoryFn(func(_ context.Context, _ *a2a.AgentCard, iface *a2a.AgentInterface) (a2aclient.Transport, error) {
+		return a2aclient.NewJSONRPCTransport(iface.URL, httpClient), nil
+	})
+	rest := a2aclient.TransportFactoryFn(func(_ context.Context, _ *a2a.AgentCard, iface *a2a.AgentInterface) (a2aclient.Transport, error) {
+		u, err := url.Parse(iface.URL)
+		if err != nil {
+			return nil, err
+		}
+		return a2aclient.NewRESTTransport(u, httpClient), nil
+	})
+	return []a2aclient.FactoryOption{
+		a2aclient.WithCompatTransport(version, a2a.TransportProtocolJSONRPC, jsonrpc),
+		a2aclient.WithCompatTransport(version, a2a.TransportProtocolHTTPJSON, rest),
+	}
 }
 
 func resolveCard(ctx context.Context, opts Options, version string, httpClient *http.Client) (*a2a.AgentCard, error) {
@@ -147,6 +204,13 @@ type SendRequest struct {
 // Task or a bare Message (the Go hello-world server returns a Message) — both are
 // normalized to a TaskResult (design §3.4).
 func (c *Client) Send(ctx context.Context, req SendRequest) (*envelope.TaskResult, error) {
+	// Bound the send phase on the context when --timeout is set (audit M-1); the
+	// per-request http.Client timeout is the always-on safety net.
+	if c.timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, c.timeout)
+		defer cancel()
+	}
 	msg := a2a.NewMessage(a2a.MessageRoleUser, a2a.NewTextPart(req.Text))
 	if req.ContextID != "" {
 		msg.ContextID = req.ContextID

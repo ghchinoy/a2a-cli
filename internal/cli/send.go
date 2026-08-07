@@ -48,8 +48,10 @@ func runSend(cmd *cobra.Command, args []string) error {
 	text := args[0]
 	flags := cmd.Flags()
 
-	// Load session for the lowest-but-one precedence layer (design §3.7).
-	sess, _ := session.Load()
+	// Load session for the lowest-but-one precedence layer (design §3.7). A
+	// non-existent session is not an error; any other Load failure is surfaced as
+	// a stderr warning once the renderer exists (never on json stdout).
+	sess, loadErr := session.Load()
 	sessionDefaults := map[string]string{}
 	if sess != nil {
 		if sess.ServiceURL != "" {
@@ -75,6 +77,9 @@ func runSend(cmd *cobra.Command, args []string) error {
 		mode = render.ModeJSON
 	}
 	r := render.New(mode, os.Stdout, os.Stderr)
+	if loadErr != nil {
+		r.Warn("WARNING: could not load session: %v", loadErr)
+	}
 
 	serviceURL := cfg.String(flagServiceURL)
 	if serviceURL == "" {
@@ -96,6 +101,7 @@ func runSend(cmd *cobra.Command, args []string) error {
 		Transport:  cfg.String(flagTransport),
 		A2AVersion: cfg.String(flagA2AVersion),
 		Insecure:   mustBool(flags, flagInsecure),
+		Timeout:    mustDuration(flags, flagTimeout),
 		Creds: &client.CallerSuppliedProvider{
 			Bearer: cfg.String(flagBearer),
 			APIKey: cfg.String(flagAPIKey),
@@ -121,7 +127,9 @@ func runSend(cmd *cobra.Command, args []string) error {
 	if tr.TaskID != nil {
 		r.Warn("task %s created (context %s)", *tr.TaskID, ptrOr(tr.ContextID, "-"))
 	}
-	captureSession(sess, tr, serviceURL, cl.Transport())
+	if err := captureSession(sess, tr, serviceURL, cl.Transport()); err != nil {
+		r.Warn("WARNING: could not persist session: %v", err)
+	}
 
 	// Blocking wait unless the first result is already terminal/interrupted (the
 	// Go hello-world server returns a terminal Message, so no polling occurs).
@@ -152,13 +160,17 @@ func runSend(cmd *cobra.Command, args []string) error {
 		if envelope.IsInterrupted(tr.State) {
 			r.ResumeHint(tr.TaskID)
 		}
+		// The task itself has already been rendered above; this error is purely an
+		// exit-code carrier, so mark it rendered to avoid a duplicate diagnostic
+		// from the top-level handler.
+		stateErr.MarkRendered()
 		return stateErr
 	}
 	return nil
 }
 
 // captureSession persists the latest conversation identifiers (spec §6.4).
-func captureSession(prev *session.Session, tr *envelope.TaskResult, serviceURL, transport string) {
+func captureSession(prev *session.Session, tr *envelope.TaskResult, serviceURL, transport string) error {
 	s := &session.Session{ServiceURL: serviceURL, Transport: transport}
 	if prev != nil {
 		s.ContextID = prev.ContextID
@@ -169,27 +181,33 @@ func captureSession(prev *session.Session, tr *envelope.TaskResult, serviceURL, 
 	if tr.TaskID != nil {
 		s.LatestTaskID = *tr.TaskID
 	}
-	_ = session.Save(s)
+	return session.Save(s)
 }
 
-// renderAndReturn renders a clierr.Error (or generic error) as an Appendix B
-// error object and returns it for exit-code mapping.
+// renderAndReturn renders an error as an Appendix B error object, marks it
+// rendered (so cli.Execute does not surface it a second time), and returns it for
+// exit-code mapping. A non-clierr error is wrapped as GENERIC, preserving its
+// cause for errors.Is/As.
 func renderAndReturn(r *render.Renderer, err error) error {
 	var ce *clierr.Error
-	if errors.As(err, &ce) {
-		_ = r.RenderError(ce.ToEnvelope())
-	} else {
-		_ = r.RenderError(envelope.CLIError{Code: string(clierr.KindGeneric), Message: err.Error()})
+	if !errors.As(err, &ce) {
+		ce = clierr.Wrap(clierr.KindGeneric, err.Error(), err)
 	}
-	return err
+	_ = r.RenderError(ce.ToEnvelope())
+	ce.MarkRendered()
+	return ce
 }
 
 func usageError(r *render.Renderer, msg string) error {
 	e := clierr.New(clierr.KindUsage, msg)
 	_ = r.RenderError(e.ToEnvelope())
+	e.MarkRendered()
 	return e
 }
 
+// parseHeaders parses repeatable -H "Name: Value" flags into a map, validating
+// each header (audit L-2): the name must be a non-empty RFC 7230 token and the
+// value must not contain CR or LF. Malformed input yields a usage error.
 func parseHeaders(hs []string) (map[string]string, error) {
 	if len(hs) == 0 {
 		return nil, nil
@@ -200,9 +218,40 @@ func parseHeaders(hs []string) (map[string]string, error) {
 		if !ok {
 			return nil, errString("invalid header (want 'Name: Value'): " + h)
 		}
-		out[strings.TrimSpace(name)] = strings.TrimSpace(val)
+		name = strings.TrimSpace(name)
+		val = strings.TrimSpace(val)
+		if name == "" {
+			return nil, errString("invalid header (empty name): " + h)
+		}
+		if !isValidHeaderName(name) {
+			return nil, errString("invalid header name: " + name)
+		}
+		if strings.ContainsAny(val, "\r\n") {
+			return nil, errString("invalid header value (contains CR/LF) for: " + name)
+		}
+		out[name] = val
 	}
 	return out, nil
+}
+
+// isValidHeaderName reports whether name is a valid RFC 7230 header field-name
+// (a non-empty token).
+func isValidHeaderName(name string) bool {
+	for _, c := range name {
+		if !isTokenChar(c) {
+			return false
+		}
+	}
+	return true
+}
+
+// isTokenChar reports whether c is a valid RFC 7230 token character.
+func isTokenChar(c rune) bool {
+	switch {
+	case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
+		return true
+	}
+	return strings.ContainsRune("!#$%&'*+-.^_`|~", c)
 }
 
 func ptrOr(s *string, fallback string) string {

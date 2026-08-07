@@ -50,11 +50,24 @@ type Error struct {
 	Message string
 	A2ACode any
 	cause   error
+
+	// rendered records whether this error has already been surfaced to the user
+	// through a render.Renderer. It lets the top-level handler (cli.Execute) emit
+	// a diagnostic for errors that never reached a renderer — e.g. cobra-level
+	// usage errors raised before a command builds one — without double-rendering
+	// errors the command already surfaced.
+	rendered bool
 }
 
 func (e *Error) Error() string { return e.Message }
 
 func (e *Error) Unwrap() error { return e.cause }
+
+// MarkRendered records that this error has already been surfaced to the user.
+func (e *Error) MarkRendered() { e.rendered = true }
+
+// Rendered reports whether this error has already been surfaced to the user.
+func (e *Error) Rendered() bool { return e.rendered }
 
 // New builds an Error of the given kind.
 func New(kind Kind, msg string) *Error {

@@ -72,7 +72,10 @@ func selectInterface(card *a2a.AgentCard, requested, serviceURL string) (*a2a.Ag
 				return iface, requested, nil
 			}
 		}
-		return nil, "", clierr.New(clierr.KindUnreachable, "agent card does not offer transport "+requested)
+		// A local request/card mismatch is a usage error (exit 2), consistent with
+		// unknown/unsupported transports above — no dial has been attempted, so it
+		// is not "unreachable" (review O1, EM decision).
+		return nil, "", clierr.New(clierr.KindUsage, "agent card does not offer transport "+requested)
 	}
 
 	// 2. Card's declared preference order: first interface we support.
