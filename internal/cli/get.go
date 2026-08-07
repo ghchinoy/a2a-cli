@@ -103,12 +103,21 @@ func runGet(cmd *cobra.Command, args []string) error {
 	}
 
 	// --history <n> threads HistoryLength only when the flag was set (a bare `get`
-	// leaves it unset so the server applies its own default).
+	// leaves it unset so the server applies its own default). A negative count is
+	// nonsensical input, so it is a USAGE error (exit 2) rather than a silent drop —
+	// consistent with the central -o value check (CO-1) and with pflag rejecting an
+	// out-of-range integer at parse time. n == 0 stays valid (forwarded verbatim);
+	// large parseable values are forwarded unclamped (upper-clamp tracked to Phase 6).
 	opts := client.GetOpts{IncludeArtifacts: mustBool(flags, flagIncludeArtifacts)}
 	if flags.Changed(flagHistory) {
-		if n, herr := flags.GetInt(flagHistory); herr == nil && n >= 0 {
-			opts.HistoryLength = &n
+		n, herr := flags.GetInt(flagHistory)
+		if herr != nil {
+			return usageError(r, "invalid --history value")
 		}
+		if n < 0 {
+			return usageError(r, "--history must be zero or a positive number")
+		}
+		opts.HistoryLength = &n
 	}
 
 	// SIGINT cancels the context but never loses the taskId (it is the argument, §7.3).

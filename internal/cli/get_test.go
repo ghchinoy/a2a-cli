@@ -247,6 +247,174 @@ func TestGet_History_ThreadsHistoryLength(t *testing.T) {
 	}
 }
 
+// B. --history edge values: n=0 is valid and forwarded verbatim; a negative n is
+// a USAGE error (exit 2, text stderr diagnostic, empty stdout) per the EM
+// decision; a large-but-parseable n is forwarded unclamped (upper-clamp is a
+// Phase-6 item). Asserts the forwarded query value where the existing --history
+// test does.
+func TestGet_History_EdgeValues(t *testing.T) {
+	t.Run("zero_forwarded", func(t *testing.T) {
+		cleanConfigDir(t)
+		var got atomic.Value
+		got.Store("")
+		srv := newTaskServer(t, taskEndpoint{
+			getFn: func(id, historyLength string) (int, any) {
+				got.Store(historyLength)
+				return 200, taskDoc(id, "ctx-1", "TASK_STATE_COMPLETED")
+			},
+		})
+		_, errOut, code := runCLI(t, "get", "task-42", "-u", srv.URL, "--history", "0")
+		if code != 0 {
+			t.Fatalf("exit = %d, want 0\nstderr: %s", code, errOut)
+		}
+		if v := got.Load().(string); v != "0" {
+			t.Errorf("historyLength forwarded = %q, want %q (n=0 is valid and threaded)", v, "0")
+		}
+	})
+
+	t.Run("negative_usage", func(t *testing.T) {
+		cleanConfigDir(t)
+		var reached atomic.Bool
+		srv := newTaskServer(t, taskEndpoint{
+			getFn: func(id, _ string) (int, any) {
+				reached.Store(true)
+				return 200, taskDoc(id, "ctx-1", "TASK_STATE_COMPLETED")
+			},
+		})
+		out, errOut, code := runCLI(t, "get", "task-42", "-u", srv.URL, "--history", "-1")
+		if code != 2 {
+			t.Fatalf("exit = %d, want 2 (negative --history is a USAGE error)\nstderr: %s", code, errOut)
+		}
+		if !strings.Contains(errOut, "USAGE") {
+			t.Errorf("negative --history should emit a USAGE diagnostic on stderr, got %q", errOut)
+		}
+		if out != "" {
+			t.Errorf("stdout should be empty for a usage error, got %q", out)
+		}
+		if reached.Load() {
+			t.Error("a negative --history must be rejected before any server call")
+		}
+	})
+
+	t.Run("large_forwarded", func(t *testing.T) {
+		cleanConfigDir(t)
+		var got atomic.Value
+		got.Store("")
+		srv := newTaskServer(t, taskEndpoint{
+			getFn: func(id, historyLength string) (int, any) {
+				got.Store(historyLength)
+				return 200, taskDoc(id, "ctx-1", "TASK_STATE_COMPLETED")
+			},
+		})
+		_, errOut, code := runCLI(t, "get", "task-42", "-u", srv.URL, "--history", "1000000")
+		if code != 0 {
+			t.Fatalf("exit = %d, want 0\nstderr: %s", code, errOut)
+		}
+		if v := got.Load().(string); v != "1000000" {
+			t.Errorf("large --history forwarded = %q, want %q (no client-side clamp)", v, "1000000")
+		}
+	})
+}
+
+// C. get one-shot terminal-state exit mapping (design §3.5): a FAILED task exits
+// 5; an INPUT_REQUIRED task exits 6 with a resume hint on stderr. Previously only
+// COMPLETED->0 was covered.
+func TestGet_OneShot_TerminalExitMapping(t *testing.T) {
+	t.Run("failed_exit5", func(t *testing.T) {
+		cleanConfigDir(t)
+		srv := newTaskServer(t, taskEndpoint{
+			getFn: func(id, _ string) (int, any) {
+				return 200, taskDoc(id, "ctx-1", "TASK_STATE_FAILED")
+			},
+		})
+		out, errOut, code := runCLI(t, "get", "task-42", "-u", srv.URL)
+		if code != 5 {
+			t.Fatalf("exit = %d, want 5 (FAILED)\nstdout: %s\nstderr: %s", code, out, errOut)
+		}
+	})
+
+	t.Run("input_required_exit6_resume_hint", func(t *testing.T) {
+		cleanConfigDir(t)
+		srv := newTaskServer(t, taskEndpoint{
+			getFn: func(id, _ string) (int, any) {
+				return 200, taskDoc(id, "ctx-1", "TASK_STATE_INPUT_REQUIRED")
+			},
+		})
+		_, errOut, code := runCLI(t, "get", "task-42", "-u", srv.URL)
+		if code != 6 {
+			t.Fatalf("exit = %d, want 6 (INPUT_REQUIRED)\nstderr: %s", code, errOut)
+		}
+		if !strings.Contains(errOut, "task-42") {
+			t.Errorf("INPUT_REQUIRED should print a resume hint carrying the taskId, got %q", errOut)
+		}
+	})
+}
+
+// D. get --wait stops on an interrupted state (WORKING -> INPUT_REQUIRED) as well
+// as a terminal one: the loop halts, exit = 6 with the resume hint, and json
+// stdout stays a single clean envelope (transitions never leak onto stdout).
+func TestGet_Wait_StopsOnInterrupted(t *testing.T) {
+	cleanConfigDir(t)
+	var calls atomic.Int32
+	srv := newTaskServer(t, taskEndpoint{
+		getFn: func(id, _ string) (int, any) {
+			if calls.Add(1) >= 3 {
+				return 200, taskDoc(id, "ctx-1", "TASK_STATE_INPUT_REQUIRED")
+			}
+			return 200, taskDoc(id, "ctx-1", "TASK_STATE_WORKING")
+		},
+	})
+
+	out, errOut, code := runCLI(t, "get", "task-42", "-u", srv.URL, "-o", "json", "--wait", "--poll-interval", "10ms", "--timeout", "5s")
+	if code != 6 {
+		t.Fatalf("exit = %d, want 6 (interrupted stops the wait)\nstdout: %s\nstderr: %s", code, out, errOut)
+	}
+	if !strings.Contains(errOut, "task-42") {
+		t.Errorf("interrupted --wait should surface a resume hint with the taskId, got %q", errOut)
+	}
+	var env map[string]any
+	if err := json.Unmarshal([]byte(out), &env); err != nil {
+		t.Fatalf("--wait json stdout must stay a single valid envelope: %v\n%s", err, out)
+	}
+	if env["state"] != "TASK_STATE_INPUT_REQUIRED" {
+		t.Errorf("final envelope state = %v, want TASK_STATE_INPUT_REQUIRED", env["state"])
+	}
+}
+
+// G. --include-artifacts in text mode: by default artifacts are summarized (no
+// content line), and the flag renders the full artifact contents.
+func TestGet_IncludeArtifacts_TextMode(t *testing.T) {
+	cleanConfigDir(t)
+	srv := newTaskServer(t, taskEndpoint{
+		getFn: func(id, _ string) (int, any) {
+			doc := taskDoc(id, "ctx-1", "TASK_STATE_COMPLETED")
+			doc["artifacts"] = []map[string]any{textArtifact("a1", "result", "the answer is 42")}
+			return 200, doc
+		},
+	})
+
+	// Default: summarized — the artifact content must NOT appear in text output.
+	out, _, code := runCLI(t, "get", "task-42", "-u", srv.URL)
+	if code != 0 {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if strings.Contains(out, "the answer is 42") {
+		t.Errorf("default text get should summarize (no artifact content), got:\n%s", out)
+	}
+	if !strings.Contains(out, "result") {
+		t.Errorf("default text get should still name the artifact, got:\n%s", out)
+	}
+
+	// --include-artifacts: full content rendered.
+	out, _, code = runCLI(t, "get", "task-42", "-u", srv.URL, "--include-artifacts")
+	if code != 0 {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if !strings.Contains(out, "the answer is 42") {
+		t.Errorf("--include-artifacts text mode should render artifact content, got:\n%s", out)
+	}
+}
+
 func TestGet_Wait_PollsToTerminal(t *testing.T) {
 	cleanConfigDir(t)
 	var calls atomic.Int32

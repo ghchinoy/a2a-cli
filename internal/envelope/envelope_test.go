@@ -9,6 +9,8 @@
 package envelope
 
 import (
+	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/a2aproject/a2a-go/v2/a2a"
@@ -121,6 +123,31 @@ func TestFromTask_History(t *testing.T) {
 	// A task without history yields no History field (omitempty stability).
 	if tr := FromTask(&a2a.Task{ID: "t", Status: a2a.TaskStatus{State: a2a.TaskStateWorking}}); tr.History != nil {
 		t.Errorf("History should be nil when absent, got %+v", tr.History)
+	}
+}
+
+// F. The additive History field is omitempty: a TaskResult with no history must
+// marshal WITHOUT a "history" key at all, so existing json consumers see the
+// frozen envelope shape (design §3.8, only additive/omitempty fields).
+func TestTaskResult_HistoryOmitemptyJSON(t *testing.T) {
+	id := "t1"
+	tr := TaskResult{TaskID: &id, State: StateCompleted}
+	b, err := json.Marshal(tr)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if strings.Contains(string(b), "history") {
+		t.Errorf("no-history TaskResult must omit the history key, got %s", b)
+	}
+
+	// With history present, the key appears.
+	tr.History = []Message{{Role: "ROLE_USER", Parts: []Part{{Text: "hi"}}}}
+	b, err = json.Marshal(tr)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !strings.Contains(string(b), "history") {
+		t.Errorf("TaskResult with history must include the history key, got %s", b)
 	}
 }
 

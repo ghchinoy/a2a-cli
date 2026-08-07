@@ -111,6 +111,32 @@ func TestCancel_Missing_NotFound(t *testing.T) {
 	}
 }
 
+// H. not-cancelable then follow-up-get-ALSO-fails: the idempotency fallback tries
+// a get to report the resting state, but when that get itself fails the ORIGINAL
+// error must surface (non-zero exit, no panic) rather than being swallowed. Closes
+// the uncovered CancelTask/classify fallback-failure branch.
+func TestCancel_NotCancelable_FollowupGetFails(t *testing.T) {
+	cleanConfigDir(t)
+	srv := newTaskServer(t, taskEndpoint{
+		cancelFn: func(_ string) (int, any) { return 409, notCancelableBody() },
+		getFn:    func(_, _ string) (int, any) { return 500, errorBody(500, "INTERNAL", "backend down", "INTERNAL") },
+	})
+
+	out, errOut, code := runCLI(t, "cancel", "task-42", "-u", srv.URL, "-o", "json")
+	if code == 0 {
+		t.Fatalf("exit = %d, want non-zero (both cancel and fallback get failed)\nstderr: %s", code, errOut)
+	}
+	var env map[string]any
+	if err := json.Unmarshal([]byte(out), &env); err != nil {
+		t.Fatalf("stdout is not a single valid JSON error object: %v\n%s", err, out)
+	}
+	// The surfaced error is the ORIGINAL cancel failure, not the fallback get's.
+	msg, _ := env["message"].(string)
+	if !strings.Contains(msg, "cancel") {
+		t.Errorf("surfaced error should be the original cancel failure, got message %q", msg)
+	}
+}
+
 func TestCancel_MissingArg_Usage(t *testing.T) {
 	cleanConfigDir(t)
 	_, errOut, code := runCLI(t, "cancel", "-u", "http://x")
