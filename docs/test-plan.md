@@ -7,16 +7,18 @@ compliance-report** notion, so the team can execute it end to end at Phase 8 and
 The plan is intentionally comprehensive — it enumerates the full Tier-1 acceptance surface. Each
 step is clearly marked as either:
 
-- **✅ Exercisable now** — runnable against the current merged build (Phase 1: `send` over HTTP+JSON).
-  Expected output below was captured from the built binary against the live Go hello-world REST
-  server.
+- **✅ Exercisable now** — runnable against the current merged build (Phases 1–2: `send` and
+  `discover` over HTTP+JSON). Expected output below was captured from the built binary against the
+  live Go hello-world REST server.
 - **⏳ Pending** — the criterion is specified but the code that satisfies it is not merged yet; the
   step names the phase (per design §9) that unlocks it.
 
-> **Merged surface at time of writing.** Only Phase 1 is on `main`: the `send` command, global-flag
-> parsing, card-driven HTTP+JSON transport selection, the JSON envelope + error normalization,
-> exit-code mapping, blocking wait, and session capture. `discover` / `get` / `cancel`, streaming,
-> `--context-id` / `--task-id` continuation semantics, and the `SKILL.md` bundle are not yet merged.
+> **Merged surface at time of writing.** Phases 1–2 are on `main`: the `send` command, the
+> `discover` command (full card presentation, `--card-url`, `--validate`, surfaced card-driven
+> transport selection), global-flag parsing, card-driven HTTP+JSON transport selection, the JSON
+> envelope + error normalization, exit-code mapping, blocking wait, and session capture. `get` /
+> `cancel`, streaming, `--context-id` / `--task-id` continuation semantics, and the `SKILL.md` bundle
+> are not yet merged.
 
 ## Contents
 
@@ -130,14 +132,80 @@ card advertises. Protocol version defaults to `1.0` (see T7).
 
 **✅ Exercisable now — `send`:** covered by T1/T3.
 
-**⏳ Pending — `discover` (Phase 2), `get` + `cancel` (Phase 3).** These commands are not merged.
-Verify their absence:
+**✅ Exercisable now — `discover` (Phase 2):** the command resolves the card, presents every section
+(identity, capabilities, interfaces, security schemes, skills), and surfaces the transport the client
+would select.
 
 ```bash
-a2a-cli --help    # Available Commands: completion, help, send
+a2a-cli discover -u http://127.0.0.1:9001
 ```
 
-`discover`, `get`, and `cancel` should **not** appear. Re-run T2 in full once Phases 2–3 land.
+Expected (exit `0`):
+
+```text
+Name:        REST Hello World Agent
+Description: Just a rest hello world agent
+
+Capabilities:
+  streaming:         true
+  pushNotifications: false
+  extendedAgentCard: false
+
+Interfaces:
+  - HTTP+JSON http://127.0.0.1:9001 [v1.0]
+
+Security schemes:
+  (none — no authentication required)
+
+Skills:
+  - hello_world (REST Hello world!)
+      Returns a 'Hello from REST server!'
+      tags: hello world
+
+Selected transport: http-json -> http://127.0.0.1:9001
+  reason: card-declared preference (first supported interface: http-json)
+```
+
+The exact `reason` string above assumes a **clean session** (no stored transport). If a prior
+`send`/`discover` has persisted `transport: http-json` to `session.json`, the stored value is treated
+as an explicit override and the reason instead reads `explicit --transport=http-json`; delete the
+session file (see T5) to reproduce the card-declared-preference wording.
+
+`-o json` (or `-n`) emits the normalized card envelope on stdout — every field above plus
+`defaultInputModes` / `defaultOutputModes` and the `selection` object — and nothing else:
+
+```bash
+a2a-cli discover -u http://127.0.0.1:9001 -o json | jq .selection.transport   # "http-json"
+```
+
+`--card-url` targets a card off the well-known path, and `--validate` checks the card's
+required-field structure (a conformance aid, not a security check), printing a note to **stderr** and
+still presenting a valid card:
+
+```bash
+a2a-cli discover -u http://127.0.0.1:9001 --validate 2>&1 1>/dev/null
+# -> card is valid against the A2A card schema
+```
+
+`discover` honors card-driven transport selection: an explicit `--transport http-json` reports
+`reason: explicit --transport=http-json`; `--transport grpc` is rejected (exit `2`,
+`Error [USAGE]: transport not supported at Tier 1: grpc`); and `--transport jsonrpc` is rejected
+because the card doesn't advertise it (exit `2`, `Error [USAGE]: agent card does not offer transport
+jsonrpc`). An unreachable target exits `3` with a normalized `UNREACHABLE` error, and calling
+`discover` with neither `-u` nor `--card-url` is a usage error (exit `2`).
+
+**⏳ Pending — `get` + `cancel` (Phase 3).** These commands are not merged. Verify their absence:
+
+```bash
+a2a-cli --help    # Available Commands: completion, discover, help, send
+```
+
+`get` and `cancel` should **not** appear. Re-run T2 in full once Phase 3 lands.
+
+- ✅ `discover` full-card presentation, `-o json` envelope, `--card-url`, `--validate`, and surfaced
+  transport selection — verified against the built binary.
+- ⏳ `discover` against a **multi-interface** card (preference ordering, routing identifier) needs the
+  Tier-2 Python fixture — the hello-world card declares a single HTTP+JSON interface.
 
 ### T3 — JSON envelope (AC 3)
 
@@ -213,6 +281,7 @@ stderr is not discarded.
 | `0` | Task completed | `a2a-cli send "hi" -u http://127.0.0.1:9001` | ✅ |
 | `2` | Usage error | `a2a-cli send -u http://127.0.0.1:9001` (no message arg) → `Error [USAGE]: send requires exactly one <text> argument` | ✅ |
 | `2` | Usage error | `a2a-cli send "hi" -u http://127.0.0.1:9001 --transport grpc` → `Error [USAGE]: transport not supported at Tier 1: grpc` | ✅ |
+| `2` | Usage error | `a2a-cli send "hi" -u http://127.0.0.1:9001 -o yaml` → `Error [USAGE]: invalid --output value "yaml" (want one of: text, json, tui)` | ✅ |
 | `3` | Unreachable | `a2a-cli send "hi" -u http://127.0.0.1:9999` → `Error [UNREACHABLE]: ...connection refused` | ✅ |
 
 Check a code explicitly:
@@ -306,7 +375,9 @@ a2a-cli send "hi" -u http://127.0.0.1:9001 --transport jsonrpc     # exit 2
 ```
 
 The last case confirms the client selects from the card's declared interfaces and rejects a binding
-the card doesn't offer, rather than assuming one.
+the card doesn't offer, rather than assuming one. `discover` makes the same selection visible without
+sending a message — its `Selected transport` line reports the chosen binding, URL, and reason (see
+[T2](#t2--commands-ac-2)).
 
 **✅ Exercisable now — version signaling:** the default `--a2a-version` is `1.0` (`send --help`); the
 value is sent on every request. The Go hello-world server logs only method, path, and body — **not
@@ -364,7 +435,7 @@ Mapping design §10 Tier-1 acceptance criteria to this plan and to the current m
 | AC (design §10) | Test | Status against merged build | Unlocked by |
 |---|---|---|---|
 | 1 — Defaults (§4.5) | [T1](#t1--defaults-ac-1) | ◑ Partial — HTTP+JSON / blocking / text / TLS / v1.0 verified; interrupted-stop pending | Phases 3–4 |
-| 2 — Commands `discover`/`send`/`get`/`cancel` (§8.1–8.4) | [T2](#t2--commands-ac-2) | ◑ Partial — `send` only | Phases 2–3 |
+| 2 — Commands `discover`/`send`/`get`/`cancel` (§8.1–8.4) | [T2](#t2--commands-ac-2) | ◑ Partial — `send` + `discover` verified; `get`/`cancel` pending | Phase 3 |
 | 3 — JSON envelope (Appendix B, §9.3) | [T3](#t3--json-envelope-ac-3) | ◑ Partial — success + error envelope + stdout/stderr verified; artifacts/NDJSON/cross-binding pending | Phases 3/5, Tier 2 |
 | 4 — Exit codes 0–7 (§9.5) | [T4](#t4--exit-codes-ac-4) | ◑ Partial — 0/2/3 verified; 1/4/5/6/7 mapped + unit-tested, not yet triggerable end to end | Phases 3–6 |
 | 5 — Conversation/session (§6) | [T5](#t5--conversation--session-ac-5) | ◑ Partial — capture/replay + report-back verified; continuation semantics, resume hint, `--continue` pending | Phase 4 |
@@ -389,21 +460,19 @@ report must state:
 - **transports covered** — HTTP+JSON at Tier 1;
 - conformance to the **conversation/session (§6)** and **polling (§7)** requirements.
 
-Until Phases 2–8 land, only the `send` / HTTP+JSON rows of this report are exercisable; the coverage
-matrix above is the interim record of what has been validated against the merged build.
+Until Phases 3–8 land, only the `send` and `discover` / HTTP+JSON rows of this report are
+exercisable; the coverage matrix above is the interim record of what has been validated against the
+merged build.
 
 ## Items of concern
 
 Observations from validating the merged build, flagged for the lead/reviewer:
 
-1. **Invalid `-o` value is silently accepted.** `a2a-cli send "hi" -u <url> -o yaml` does not error;
-   it falls back to text output and exits `0`. Spec §9 treats bad flag values as a usage error
-   (exit `2`). Confirm whether Phase 1 intends to validate the `--output` value.
-2. **`--task-id <missing>` returns a raw generic error (exit `1`).** Against the sample server,
+1. **`--task-id <missing>` returns a raw generic error (exit `1`).** Against the sample server,
    `--task-id nonexistent` yields `code: "GENERIC"` with the SDK's `"task not found"` message rather
    than a normalized `NOT_FOUND` code. Full continuation semantics (spec §6.2, "surface server error,
    not silently start a new task") are a Phase 4 concern; noting that the current code path surfaces
    the error but does not yet normalize it.
-3. **No `--continue` / `--last` flag yet.** Session auto-supplies the last service URL, which covers
+2. **No `--continue` / `--last` flag yet.** Session auto-supplies the last service URL, which covers
    part of spec §6.4, but the named flag is not present. Expected at Phase 4 — documented as pending,
    not as working.
