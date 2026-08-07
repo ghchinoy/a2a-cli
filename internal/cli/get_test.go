@@ -296,7 +296,9 @@ func TestGet_History_EdgeValues(t *testing.T) {
 		}
 	})
 
-	t.Run("large_forwarded", func(t *testing.T) {
+	// CO-8 / R-3: an absurd --history value is CLAMPED client-side to the sane
+	// maximum (with a stderr warning), not forwarded verbatim.
+	t.Run("large_clamped", func(t *testing.T) {
 		cleanConfigDir(t)
 		var got atomic.Value
 		got.Store("")
@@ -310,8 +312,34 @@ func TestGet_History_EdgeValues(t *testing.T) {
 		if code != 0 {
 			t.Fatalf("exit = %d, want 0\nstderr: %s", code, errOut)
 		}
-		if v := got.Load().(string); v != "1000000" {
-			t.Errorf("large --history forwarded = %q, want %q (no client-side clamp)", v, "1000000")
+		if v := got.Load().(string); v != "1000" {
+			t.Errorf("absurd --history forwarded = %q, want %q (clamped client-side)", v, "1000")
+		}
+		if !strings.Contains(errOut, "clamping") {
+			t.Errorf("clamping an absurd --history should warn on stderr, got %q", errOut)
+		}
+	})
+
+	// A value at the clamp ceiling is forwarded verbatim (no warning).
+	t.Run("ceiling_forwarded", func(t *testing.T) {
+		cleanConfigDir(t)
+		var got atomic.Value
+		got.Store("")
+		srv := newTaskServer(t, taskEndpoint{
+			getFn: func(id, historyLength string) (int, any) {
+				got.Store(historyLength)
+				return 200, taskDoc(id, "ctx-1", "TASK_STATE_COMPLETED")
+			},
+		})
+		_, errOut, code := runCLI(t, "get", "task-42", "-u", srv.URL, "--history", "1000")
+		if code != 0 {
+			t.Fatalf("exit = %d, want 0\nstderr: %s", code, errOut)
+		}
+		if v := got.Load().(string); v != "1000" {
+			t.Errorf("--history at the ceiling forwarded = %q, want %q", v, "1000")
+		}
+		if strings.Contains(errOut, "clamping") {
+			t.Errorf("--history at the ceiling should NOT warn, got %q", errOut)
 		}
 	})
 }

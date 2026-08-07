@@ -35,6 +35,16 @@ type CallerSuppliedProvider struct {
 	Extra  map[string]string
 }
 
+// HasCredentials reports whether this provider would attach anything. New() uses
+// it to decide whether the cross-origin/downgrade credential warning is relevant
+// (D5 / CO-7): an empty provider has nothing to withhold or forward.
+func (p *CallerSuppliedProvider) HasCredentials() bool {
+	if p == nil {
+		return false
+	}
+	return p.Bearer != "" || p.APIKey != "" || len(p.Extra) > 0
+}
+
 // Headers implements CredentialProvider.
 func (p *CallerSuppliedProvider) Headers(_ context.Context, _ Target) (map[string]string, error) {
 	if p == nil {

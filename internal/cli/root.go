@@ -47,6 +47,15 @@ const (
 	flagAPIKey       = "api-key"
 	flagHeader       = "header"
 	flagInsecure     = "insecure"
+	flagAllowXOrigin = "allow-cross-origin-credentials"
+)
+
+// Credential environment-variable equivalents (spec §10.1). Precedence is
+// explicit flag > env var > unset. -H/--header stays flag-only (a header string
+// is not cleanly expressible as a single env var).
+const (
+	envBearer = "A2A_BEARER"
+	envAPIKey = "A2A_API_KEY"
 )
 
 // NewRootCommand builds the root command with all global/persistent flags.
@@ -119,6 +128,9 @@ func NewRootCommand() *cobra.Command {
 	pf.String(flagAPIKey, "", "API key (sent as X-API-Key)")
 	pf.StringArrayP(flagHeader, "H", nil, "extra header in 'Name: Value' form (repeatable)")
 	pf.Bool(flagInsecure, false, "skip TLS certificate verification (emits a warning)")
+	// Off by default: caller credentials are withheld from a cross-origin or
+	// downgraded interface target unless the operator opts in (D5 / CO-7).
+	pf.Bool(flagAllowXOrigin, false, "forward caller credentials to a cross-origin or downgraded interface target (default: withhold); this trusts that target for the full request lifecycle, including any redirects it issues (caller headers are not stripped across redirects)")
 
 	root.AddCommand(newDiscoverCommand())
 	root.AddCommand(newSendCommand())

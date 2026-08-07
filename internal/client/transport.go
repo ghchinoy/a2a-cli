@@ -47,10 +47,19 @@ var supported = map[a2a.TransportProtocol]bool{
 
 // selection is the outcome of card-driven transport selection: the chosen
 // interface, its CLI transport name, and a one-line human-readable reason.
+//
+// crossOrigin/downgraded flag whether the selected interface points to a
+// different origin than the card was fetched from, or is a plaintext http
+// interface reached from an https-fetched card (allowed only under --insecure).
+// New() consults them to decide whether caller credentials may ride to the
+// target (D5 / CO-7): creds are withheld from a cross-origin or downgraded
+// target unless the operator explicitly opts in.
 type selection struct {
-	iface     *a2a.AgentInterface
-	transport string
-	reason    string
+	iface       *a2a.AgentInterface
+	transport   string
+	reason      string
+	crossOrigin bool
+	downgraded  bool
 }
 
 // selectInterface performs card-driven transport selection (design §3.3,
@@ -89,10 +98,11 @@ func selectInterface(card *a2a.AgentCard, requested, serviceURL, fetchURL string
 		}
 		for _, iface := range interfaces {
 			if iface != nil && iface.ProtocolBinding == binding {
-				if err := validateInterfaceURL(iface.URL, fetchURL, insecure, warnf); err != nil {
+				crossOrigin, downgraded, err := validateInterfaceURL(iface.URL, fetchURL, insecure, warnf)
+				if err != nil {
 					return nil, err
 				}
-				return &selection{iface: iface, transport: requested, reason: "explicit --transport=" + requested}, nil
+				return &selection{iface: iface, transport: requested, reason: "explicit --transport=" + requested, crossOrigin: crossOrigin, downgraded: downgraded}, nil
 			}
 		}
 		// A local request/card mismatch is a usage error (exit 2), consistent with
@@ -104,14 +114,17 @@ func selectInterface(card *a2a.AgentCard, requested, serviceURL, fetchURL string
 	// 2. Card's declared preference order: first interface we support.
 	for _, iface := range interfaces {
 		if iface != nil && supported[iface.ProtocolBinding] {
-			if err := validateInterfaceURL(iface.URL, fetchURL, insecure, warnf); err != nil {
+			crossOrigin, downgraded, err := validateInterfaceURL(iface.URL, fetchURL, insecure, warnf)
+			if err != nil {
 				return nil, err
 			}
 			name := bindingToCLI[iface.ProtocolBinding]
 			return &selection{
-				iface:     iface,
-				transport: name,
-				reason:    "card-declared preference (first supported interface: " + name + ")",
+				iface:       iface,
+				transport:   name,
+				reason:      "card-declared preference (first supported interface: " + name + ")",
+				crossOrigin: crossOrigin,
+				downgraded:  downgraded,
 			}, nil
 		}
 	}
@@ -132,37 +145,44 @@ func selectInterface(card *a2a.AgentCard, requested, serviceURL, fetchURL string
 
 // validateInterfaceURL enforces the Tier-1 transport-selection safety checks on a
 // card-declared interface URL (audit F-2 / security fix B2). warnf may be nil.
-func validateInterfaceURL(selected, fetchURL string, insecure bool, warnf func(string, ...any)) error {
-	u, err := url.Parse(selected)
-	if err != nil {
-		return clierr.New(clierr.KindGeneric, "agent card interface URL is not a valid URL: "+selected)
+// It reports whether the selected interface is cross-origin (a different host than
+// the card fetch origin) and/or downgraded (an http interface reached from an
+// https-fetched card, allowed only under --insecure) so New() can gate credential
+// forwarding to such a target (D5 / CO-7).
+func validateInterfaceURL(selected, fetchURL string, insecure bool, warnf func(string, ...any)) (crossOrigin, downgraded bool, err error) {
+	u, perr := url.Parse(selected)
+	if perr != nil {
+		return false, false, clierr.New(clierr.KindGeneric, "agent card interface URL is not a valid URL: "+selected)
 	}
 	scheme := strings.ToLower(u.Scheme)
 	if scheme != "http" && scheme != "https" {
-		return clierr.New(clierr.KindGeneric, "agent card interface URL uses unsupported scheme "+quote(u.Scheme)+" (only http/https are allowed): "+selected)
+		return false, false, clierr.New(clierr.KindGeneric, "agent card interface URL uses unsupported scheme "+quote(u.Scheme)+" (only http/https are allowed): "+selected)
 	}
 
 	if fetchURL != "" {
 		if f, ferr := url.Parse(fetchURL); ferr == nil && f.Host != "" {
-			// Reject a TLS downgrade: a card fetched over https must not steer us
-			// to a plaintext http interface unless the operator opts in.
-			if strings.EqualFold(f.Scheme, "https") && scheme == "http" && !insecure {
-				return clierr.New(clierr.KindGeneric,
-					"agent card fetched over https declares an insecure http interface ("+selected+"); refusing to downgrade (use --insecure to override)")
+			// A card fetched over https that declares a plaintext http interface is a
+			// downgrade: refuse it unless the operator opts in, and even when allowed
+			// (under --insecure) mark it so credentials are not forwarded by default.
+			if strings.EqualFold(f.Scheme, "https") && scheme == "http" {
+				if !insecure {
+					return false, false, clierr.New(clierr.KindGeneric,
+						"agent card fetched over https declares an insecure http interface ("+selected+"); refusing to downgrade (use --insecure to override)")
+				}
+				downgraded = true
 			}
 			// Surface (but allow) a cross-origin interface: a card may legitimately
 			// point elsewhere, but the operator must see it.
-			if !strings.EqualFold(f.Host, u.Host) && warnf != nil {
-				warnf("WARNING: agent card selects a cross-origin interface: card fetched from %s but interface host is %s", f.Host, u.Host)
+			if !strings.EqualFold(f.Host, u.Host) {
+				crossOrigin = true
+				if warnf != nil {
+					warnf("WARNING: agent card selects a cross-origin interface: card fetched from %s but interface host is %s", f.Host, u.Host)
+				}
 			}
 		}
 	}
 
-	// TODO(phase6): when auth wiring lands, refuse to attach caller credentials to
-	// a cross-origin or downgraded target without an explicit per-target opt-in.
-	// The Tier-1 mitigation is the scheme-reject + downgrade-reject + cross-origin
-	// warn above.
-	return nil
+	return crossOrigin, downgraded, nil
 }
 
 // quote wraps s in double quotes for diagnostics without pulling in fmt.
