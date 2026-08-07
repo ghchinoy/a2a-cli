@@ -7,9 +7,9 @@ A command-line client for talking to [A2A protocol](https://a2a-protocol.org) ag
 terminal: send a message to an agent, wait for its answer, and get the result as readable text or
 machine-readable JSON. Built on the official [`a2a-go` v2 SDK](https://github.com/a2aproject/a2a-go).
 
-> **Status: alpha.** This is an early build of a **Tier-1** A2A client. Only **Phase 1** is
-> implemented so far — the `send` command over HTTP+JSON. More commands (`discover`, `get`,
-> `cancel`, streaming, auth flows) land as later phases complete. The `--output json` shape and the
+> **Status: alpha.** This is an early build of a **Tier-1** A2A client. Two commands are merged so
+> far — **`send`** and **`discover`**, both over HTTP+JSON. More commands (`get`, `cancel`,
+> streaming, auth flows) land as later phases complete. The `--output json` shape and the
 > exit-code scheme are a stable contract; everything else may change without notice while the
 > [a2a-cli spec](https://github.com/a2aproject/a2a-cli) is still a Draft.
 
@@ -93,12 +93,46 @@ a2a-cli send "and again"
 
 For the full flag list, run `a2a-cli send --help`.
 
+Before sending, you can inspect an agent with `discover`. It fetches the agent card, presents every
+section, and shows which transport the client would select:
+
+```bash
+a2a-cli discover -u http://127.0.0.1:9001
+```
+
+```text
+Name:        REST Hello World Agent
+Description: Just a rest hello world agent
+
+Capabilities:
+  streaming:         true
+  pushNotifications: false
+  extendedAgentCard: false
+
+Interfaces:
+  - HTTP+JSON http://127.0.0.1:9001 [v1.0]
+
+Security schemes:
+  (none — no authentication required)
+
+Skills:
+  - hello_world (REST Hello world!)
+      Returns a 'Hello from REST server!'
+      tags: hello world
+
+Selected transport: http-json -> http://127.0.0.1:9001
+  reason: card-declared preference (first supported interface: http-json)
+```
+
+Add `--validate` to check the card's required-field structure, or `-o json` for the normalized card
+envelope. See the [user guide](docs/user-guide.md#inspecting-an-agent-with-discover) for a full walkthrough.
+
 ### Commands
 
 | Command | Status | Purpose |
 |---|---|---|
 | `send` | ✅ available | Send a message to an agent and wait for the result |
-| `discover` | ⏳ planned | Fetch and inspect an agent card |
+| `discover` | ✅ available | Fetch, present, and validate an agent card |
 | `get` | ⏳ planned | Retrieve a task's status and artifacts |
 | `cancel` | ⏳ planned | Cancel an active task |
 
@@ -106,7 +140,7 @@ For the full flag list, run `a2a-cli send --help`.
 
 ### Global flags
 
-Flags are global — they attach to `send` today and to the commands still to come.
+Flags are global — they attach to `send` and `discover` today, and to the commands still to come.
 
 | Flag | Meaning |
 |---|---|
@@ -114,7 +148,7 @@ Flags are global — they attach to `send` today and to the commands still to co
 | `--card-url <url>` | Explicit agent-card URL, overriding the well-known path. |
 | `-o, --output <text\|json>` | Output format. Default `text`. |
 | `-n, --no-tui` | Shorthand for `--output json`. |
-| `--transport <http-json\|jsonrpc\|grpc>` | Transport binding. Default: card-driven, HTTP+JSON. Only HTTP+JSON is functional in Phase 1. |
+| `--transport <http-json\|jsonrpc\|grpc>` | Transport binding. Default: card-driven, HTTP+JSON. Only HTTP+JSON is functional at Tier 1. |
 | `--context-id <id>` | Continue an existing conversation. |
 | `--task-id <id>` | Send against an existing task. |
 | `--poll-interval <dur>` | Poll interval while waiting for a task. Default `2s`. |
@@ -130,11 +164,15 @@ Every flag with a default can also be set via an environment variable prefixed `
 (for example `A2A_CLI_SERVICE_URL`). Precedence is: explicit flag → environment variable →
 stored session → built-in default.
 
+`discover` adds one command-local flag: `--validate`, which checks the card's required-field
+structure (a conformance aid, not a security check) and exits non-zero if the card is invalid.
+
 ### Behavior
 
 - **Transport** defaults to HTTP+JSON, chosen from the agent card. An explicit `--transport`
   overrides it; otherwise the card's declared preference is honored. gRPC is not yet supported and
-  is rejected with a usage error.
+  is rejected with a usage error. `discover` surfaces which transport the client would select and
+  why (card-declared preference, explicit override, or the HTTP+JSON default).
 - **Blocking by default:** `send` waits until the task reaches a terminal state, and is designed to
   stop immediately on an interrupted state (`INPUT_REQUIRED` / `AUTH_REQUIRED`). The always-completing
   sample agent can't exercise the interrupted-stop path yet — see the
@@ -153,7 +191,7 @@ variables always override stored values.
 
 ## Documentation
 
-- [User guide](docs/user_guide.md) — install, quickstart, and worked `send` examples.
+- [User guide](docs/user-guide.md) — install, quickstart, and worked `send` and `discover` examples.
 - [Test plan](docs/test-plan.md) — validation and Tier-1 conformance walkthrough for reviewers and
   the conformance team.
 

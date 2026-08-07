@@ -3,11 +3,11 @@
 This guide gets a new user from nothing to a working round-trip against an A2A agent, then walks
 through the options that matter day to day.
 
-> **What works today.** `a2a-cli` is in **alpha**. Only **Phase 1** of the Tier-1 build is merged:
-> the **`send`** command over the **HTTP+JSON** transport. Commands such as `discover`, `get`, and
-> `cancel`, plus streaming and interactive OAuth login, are planned for later phases and are **not**
-> available yet. Everything in this guide has been verified against the built binary; nothing here
-> is aspirational. As more of Tier 1 lands, this guide grows with it.
+> **What works today.** `a2a-cli` is in **alpha**. Two commands of the Tier-1 build are merged: the
+> **`send`** command and the **`discover`** command, both over the **HTTP+JSON** transport. Commands
+> such as `get` and `cancel`, plus streaming and interactive OAuth login, are planned for later
+> phases and are **not** available yet. Everything in this guide has been verified against the built
+> binary; nothing here is aspirational. As more of Tier 1 lands, this guide grows with it.
 
 ## Contents
 
@@ -16,6 +16,7 @@ through the options that matter day to day.
 - [Quickstart](#quickstart)
 - [Understanding the output](#understanding-the-output)
 - [Text vs JSON](#text-vs-json)
+- [Inspecting an agent with `discover`](#inspecting-an-agent-with-discover)
 - [Choosing the target agent](#choosing-the-target-agent)
 - [Session state and omitting `-u`](#session-state-and-omitting--u)
 - [Credentials](#credentials)
@@ -119,6 +120,133 @@ a2a-cli send "hello" -u http://127.0.0.1:9001 -o json | jq -r '.message.parts[0]
 Hello from REST server!
 ```
 
+## Inspecting an agent with `discover`
+
+Before you send anything, `discover` lets you look at an agent's card: who it is, what it can do, how
+to authenticate, and which transport `a2a-cli` would use to talk to it. It performs one network
+operation — fetching and presenting the card — and makes no task calls.
+
+```bash
+a2a-cli discover -u http://127.0.0.1:9001
+```
+
+```text
+Name:        REST Hello World Agent
+Description: Just a rest hello world agent
+
+Capabilities:
+  streaming:         true
+  pushNotifications: false
+  extendedAgentCard: false
+
+Interfaces:
+  - HTTP+JSON http://127.0.0.1:9001 [v1.0]
+
+Security schemes:
+  (none — no authentication required)
+
+Skills:
+  - hello_world (REST Hello world!)
+      Returns a 'Hello from REST server!'
+      tags: hello world
+
+Selected transport: http-json -> http://127.0.0.1:9001
+  reason: card-declared preference (first supported interface: http-json)
+```
+
+The output walks the card top to bottom:
+
+- **Identity** — name, description, and (when the card declares them) version, provider, and
+  documentation URL.
+- **Capabilities** — the streaming / push-notification / extended-card flags and any declared
+  protocol extensions.
+- **Interfaces** — every transport binding the card advertises, with its URL and protocol version.
+- **Security schemes** — how the agent expects you to authenticate, or `(none — no authentication
+  required)` when it doesn't.
+- **Skills** — the operations the agent advertises, with their IDs, names, descriptions, and tags.
+- **Selected transport** — the binding `a2a-cli` would use for this card and *why*. This is the same
+  **card-driven transport selection** `send` uses: HTTP+JSON is the Tier-1 transport, and the client
+  chooses it from the card's declared interfaces (or honors an explicit `--transport`).
+
+### Pointing `discover` at a card
+
+Like `send`, `discover` fetches the card from the well-known path (`<url>/.well-known/agent-card.json`)
+when you pass `-u`. If the card lives elsewhere, point directly at it with `--card-url`:
+
+```bash
+a2a-cli discover --card-url http://127.0.0.1:9001/.well-known/agent-card.json
+```
+
+### Machine-readable output
+
+Add `-o json` (or `-n`) for the normalized card envelope on stdout — handy for piping into `jq`:
+
+```bash
+a2a-cli discover -u http://127.0.0.1:9001 -o json
+```
+
+```json
+{
+  "name": "REST Hello World Agent",
+  "description": "Just a rest hello world agent",
+  "capabilities": {
+    "streaming": true,
+    "pushNotifications": false,
+    "extendedAgentCard": false
+  },
+  "defaultInputModes": [
+    "text"
+  ],
+  "defaultOutputModes": [
+    "text"
+  ],
+  "interfaces": [
+    {
+      "transport": "HTTP+JSON",
+      "url": "http://127.0.0.1:9001",
+      "protocolVersion": "1.0"
+    }
+  ],
+  "skills": [
+    {
+      "id": "hello_world",
+      "name": "REST Hello world!",
+      "description": "Returns a 'Hello from REST server!'",
+      "tags": [
+        "hello world"
+      ],
+      "examples": [
+        "hi",
+        "hello"
+      ]
+    }
+  ],
+  "selection": {
+    "transport": "http-json",
+    "url": "http://127.0.0.1:9001",
+    "reason": "card-declared preference (first supported interface: http-json)"
+  }
+}
+```
+
+### Validating a card
+
+Pass `--validate` to check the card against the A2A card schema's required-field structure before you
+trust it. It's a conformance aid — a required-field / shape check, **not** a full JSON-Schema
+validation and **not** a security check (it does not vet URLs, credentials, or trust). A valid card
+still prints normally, with a note on stderr:
+
+```bash
+a2a-cli discover -u http://127.0.0.1:9001 --validate
+```
+
+```text
+card is valid against the A2A card schema
+```
+
+If the card is missing required fields, `discover` reports the problems and exits non-zero instead of
+presenting the card.
+
 ## Choosing the target agent
 
 Give the agent's base URL with `-u`/`--service-url`. `a2a-cli` fetches the card from the well-known
@@ -175,8 +303,8 @@ against it; use them with an agent that enforces authentication.
 
 ## Transport and protocol version
 
-Phase 1 speaks **HTTP+JSON** only. Transport is normally chosen for you from the agent card, but you
-can state it explicitly:
+Tier 1 speaks **HTTP+JSON** only. Transport is normally chosen for you from the agent card (run
+`discover` to see which binding it would pick and why), but you can state it explicitly:
 
 ```bash
 a2a-cli send "hello" -u http://127.0.0.1:9001 --transport http-json
@@ -237,7 +365,8 @@ Add `-v` for extra diagnostics on stderr while debugging.
 
 ## What's coming next
 
-Later phases of the Tier-1 build add `discover`, `get`, and `cancel`; streaming (`--stream`);
+Later phases of the Tier-1 build add `get` and `cancel`; streaming (`--stream`);
 `--context-id` / `--task-id` continuation with resume hints; and a bundled agent skill. This guide
 will be extended as each merges. Until then, treat any behavior not documented here as not yet
-available. Run `a2a-cli --help` and `a2a-cli send --help` to see the current surface at any time.
+available. Run `a2a-cli --help`, `a2a-cli send --help`, and `a2a-cli discover --help` to see the
+current surface at any time.
