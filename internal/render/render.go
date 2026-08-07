@@ -15,6 +15,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"strings"
 
 	"github.com/ghchinoy/a2a-cli/internal/envelope"
 )
@@ -81,6 +82,100 @@ func (r *Renderer) renderTaskText(tr *envelope.TaskResult) error {
 	return nil
 }
 
+// RenderCard writes a FullCard (design §8.1). In json mode it emits only the
+// normalized FullCard to stdout; in text mode it prints every card section with
+// copy-pasteable identifiers and shows which transport the client would select.
+func (r *Renderer) RenderCard(c *envelope.FullCard) error {
+	if c == nil {
+		return nil
+	}
+	if r.Mode == ModeJSON {
+		return writeJSON(r.Out, c)
+	}
+	return r.renderCardText(c)
+}
+
+func (r *Renderer) renderCardText(c *envelope.FullCard) error {
+	w := r.Out
+	fmt.Fprintf(w, "Name:        %s\n", nonEmpty(c.Name))
+	if c.Description != "" {
+		fmt.Fprintf(w, "Description: %s\n", c.Description)
+	}
+	if c.Version != "" {
+		fmt.Fprintf(w, "Version:     %s\n", c.Version)
+	}
+	if c.Provider != nil && (c.Provider.Organization != "" || c.Provider.URL != "") {
+		fmt.Fprintf(w, "Provider:    %s\n", joinNonEmpty(" — ", c.Provider.Organization, c.Provider.URL))
+	}
+	if c.DocumentationURL != "" {
+		fmt.Fprintf(w, "Docs:        %s\n", c.DocumentationURL)
+	}
+
+	fmt.Fprintf(w, "\nCapabilities:\n")
+	fmt.Fprintf(w, "  streaming:         %t\n", c.Capabilities.Streaming)
+	fmt.Fprintf(w, "  pushNotifications: %t\n", c.Capabilities.PushNotifications)
+	fmt.Fprintf(w, "  extendedAgentCard: %t\n", c.Capabilities.ExtendedAgentCard)
+	for _, ext := range c.Capabilities.Extensions {
+		req := ""
+		if ext.Required {
+			req = " (required)"
+		}
+		fmt.Fprintf(w, "  extension: %s%s\n", ext.URI, req)
+	}
+
+	fmt.Fprintf(w, "\nInterfaces:\n")
+	if len(c.Interfaces) == 0 {
+		fmt.Fprintf(w, "  (none declared)\n")
+	}
+	for _, iface := range c.Interfaces {
+		fmt.Fprintf(w, "  - %-8s %s", iface.Transport, iface.URL)
+		if iface.ProtocolVersion != "" {
+			fmt.Fprintf(w, " [v%s]", iface.ProtocolVersion)
+		}
+		if iface.RoutingID != "" {
+			fmt.Fprintf(w, " routingId=%s", iface.RoutingID)
+		}
+		fmt.Fprintf(w, "\n")
+	}
+
+	fmt.Fprintf(w, "\nSecurity schemes:\n")
+	if len(c.SecuritySchemes) == 0 {
+		fmt.Fprintf(w, "  (none — no authentication required)\n")
+	}
+	for _, s := range c.SecuritySchemes {
+		fmt.Fprintf(w, "  - %s: %s", s.Name, s.Type)
+		if s.Detail != "" {
+			fmt.Fprintf(w, " (%s)", s.Detail)
+		}
+		fmt.Fprintf(w, "\n")
+	}
+
+	fmt.Fprintf(w, "\nSkills:\n")
+	if len(c.Skills) == 0 {
+		fmt.Fprintf(w, "  (none declared)\n")
+	}
+	for _, sk := range c.Skills {
+		fmt.Fprintf(w, "  - %s", nonEmpty(sk.ID))
+		if sk.Name != "" {
+			fmt.Fprintf(w, " (%s)", sk.Name)
+		}
+		fmt.Fprintf(w, "\n")
+		if sk.Description != "" {
+			fmt.Fprintf(w, "      %s\n", sk.Description)
+		}
+		if len(sk.Tags) > 0 {
+			fmt.Fprintf(w, "      tags: %s\n", strings.Join(sk.Tags, ", "))
+		}
+	}
+
+	fmt.Fprintf(w, "\nSelected transport: %s -> %s\n", nonEmpty(c.Selection.Transport), nonEmpty(c.Selection.URL))
+	fmt.Fprintf(w, "  reason: %s\n", c.Selection.Reason)
+	if c.Selection.RoutingID != "" {
+		fmt.Fprintf(w, "  routing identifier: %s\n", c.Selection.RoutingID)
+	}
+	return nil
+}
+
 // RenderError writes a normalized error. In json mode the Appendix B error object
 // goes to stdout (still valid JSON); in text mode a human message goes to stderr.
 func (r *Renderer) RenderError(ce envelope.CLIError) error {
@@ -125,6 +220,17 @@ func ptr(s *string) string {
 		return "(none)"
 	}
 	return *s
+}
+
+// joinNonEmpty joins the non-empty arguments with sep.
+func joinNonEmpty(sep string, parts ...string) string {
+	var kept []string
+	for _, p := range parts {
+		if p != "" {
+			kept = append(kept, p)
+		}
+	}
+	return strings.Join(kept, sep)
 }
 
 func nonEmpty(s string) string {
