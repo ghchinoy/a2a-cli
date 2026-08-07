@@ -1,0 +1,283 @@
+// Copyright 2026 The a2a-cli Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+
+package cli
+
+import (
+	"context"
+	"errors"
+	"os"
+	"os/signal"
+	"strings"
+	"time"
+
+	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
+
+	"github.com/ghchinoy/a2a-cli/internal/client"
+	"github.com/ghchinoy/a2a-cli/internal/clierr"
+	"github.com/ghchinoy/a2a-cli/internal/config"
+	"github.com/ghchinoy/a2a-cli/internal/envelope"
+	"github.com/ghchinoy/a2a-cli/internal/poll"
+	"github.com/ghchinoy/a2a-cli/internal/render"
+	"github.com/ghchinoy/a2a-cli/internal/session"
+)
+
+func newSendCommand() *cobra.Command {
+	return &cobra.Command{
+		Use:   "send <text>",
+		Short: "Send a message to an agent and wait for the result",
+		Long: "Send a message to an A2A agent over HTTP+JSON (blocking by default) and " +
+			"print the normalized result. Use -o json for machine-readable output.",
+		Args: func(_ *cobra.Command, args []string) error {
+			if len(args) != 1 {
+				return clierr.New(clierr.KindUsage, "send requires exactly one <text> argument")
+			}
+			return nil
+		},
+		RunE: runSend,
+	}
+}
+
+func runSend(cmd *cobra.Command, args []string) error {
+	text := args[0]
+	flags := cmd.Flags()
+
+	// Load session for the lowest-but-one precedence layer (design §3.7). A
+	// non-existent session is not an error; any other Load failure is surfaced as
+	// a stderr warning once the renderer exists (never on json stdout).
+	sess, loadErr := session.Load()
+	sessionDefaults := map[string]string{}
+	if sess != nil {
+		if sess.ServiceURL != "" {
+			sessionDefaults[flagServiceURL] = sess.ServiceURL
+		}
+		if sess.Transport != "" {
+			sessionDefaults[flagTransport] = sess.Transport
+		}
+	}
+	defaults := map[string]string{
+		flagOutput:     "text",
+		flagA2AVersion: client.DefaultA2AVersion,
+	}
+	cfg := config.New(flags, sessionDefaults, defaults)
+
+	// Resolve output mode: -n forces json; otherwise -o value.
+	mode := render.ModeText
+	noTUI, _ := flags.GetBool(flagNoTUI)
+	switch {
+	case noTUI:
+		mode = render.ModeJSON
+	case strings.EqualFold(cfg.String(flagOutput), "json"):
+		mode = render.ModeJSON
+	}
+	r := render.New(mode, os.Stdout, os.Stderr)
+	if loadErr != nil {
+		r.Warn("WARNING: could not load session: %v", loadErr)
+	}
+
+	serviceURL := cfg.String(flagServiceURL)
+	if serviceURL == "" {
+		return usageError(r, "a service URL is required (-u/--service-url)")
+	}
+
+	headers, err := parseHeaders(mustStringArray(flags, flagHeader))
+	if err != nil {
+		return usageError(r, err.Error())
+	}
+
+	// SIGINT cancels the context but never loses an already-known taskId (§7.3).
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
+
+	cl, err := client.New(ctx, client.Options{
+		ServiceURL: serviceURL,
+		CardURL:    cfg.String(flagCardURL),
+		Transport:  cfg.String(flagTransport),
+		A2AVersion: cfg.String(flagA2AVersion),
+		Insecure:   mustBool(flags, flagInsecure),
+		Timeout:    mustDuration(flags, flagTimeout),
+		Creds: &client.CallerSuppliedProvider{
+			Bearer: cfg.String(flagBearer),
+			APIKey: cfg.String(flagAPIKey),
+			Extra:  headers,
+		},
+		Warnf: r.Warn,
+	})
+	if err != nil {
+		return renderAndReturn(r, err)
+	}
+
+	tr, err := cl.Send(ctx, client.SendRequest{
+		Text:      text,
+		ContextID: cfg.String(flagContextID),
+		TaskID:    cfg.String(flagTaskID),
+	})
+	if err != nil {
+		return renderAndReturn(r, err)
+	}
+
+	// Surface the taskId to stderr the moment it exists so it survives any later
+	// timeout/interruption (§7.3). Never fabricate ids (§6.1).
+	if tr.TaskID != nil {
+		r.Warn("task %s created (context %s)", *tr.TaskID, ptrOr(tr.ContextID, "-"))
+	}
+	if err := captureSession(sess, tr, serviceURL, cl.Transport()); err != nil {
+		r.Warn("WARNING: could not persist session: %v", err)
+	}
+
+	// Blocking wait unless the first result is already terminal/interrupted (the
+	// Go hello-world server returns a terminal Message, so no polling occurs).
+	if !envelope.IsTerminal(tr.State) && !envelope.IsInterrupted(tr.State) {
+		final, perr := poll.Wait(ctx, tr, func(c context.Context) (*envelope.TaskResult, error) {
+			return cl.GetTask(c, ptrOr(tr.TaskID, ""))
+		}, poll.Options{
+			Interval: mustDuration(flags, flagPollInterval),
+			Timeout:  mustDuration(flags, flagTimeout),
+		})
+		if final != nil {
+			tr = final
+		}
+		if perr != nil {
+			// taskId already emitted to stderr above; surface a resume hint too.
+			r.ResumeHint(tr.TaskID)
+			return renderAndReturn(r, perr)
+		}
+	}
+
+	if err := r.RenderTask(tr); err != nil {
+		return err
+	}
+
+	// Map the final state to an exit code (design §3.5). Interrupted states also
+	// get a resume hint on stderr.
+	if stateErr := clierr.FromState(tr.State); stateErr != nil {
+		if envelope.IsInterrupted(tr.State) {
+			r.ResumeHint(tr.TaskID)
+		}
+		// The task itself has already been rendered above; this error is purely an
+		// exit-code carrier, so mark it rendered to avoid a duplicate diagnostic
+		// from the top-level handler.
+		stateErr.MarkRendered()
+		return stateErr
+	}
+	return nil
+}
+
+// captureSession persists the latest conversation identifiers (spec §6.4).
+func captureSession(prev *session.Session, tr *envelope.TaskResult, serviceURL, transport string) error {
+	s := &session.Session{ServiceURL: serviceURL, Transport: transport}
+	if prev != nil {
+		s.ContextID = prev.ContextID
+	}
+	if tr.ContextID != nil {
+		s.ContextID = *tr.ContextID
+	}
+	if tr.TaskID != nil {
+		s.LatestTaskID = *tr.TaskID
+	}
+	return session.Save(s)
+}
+
+// renderAndReturn renders an error as an Appendix B error object, marks it
+// rendered (so cli.Execute does not surface it a second time), and returns it for
+// exit-code mapping. A non-clierr error is wrapped as GENERIC, preserving its
+// cause for errors.Is/As.
+func renderAndReturn(r *render.Renderer, err error) error {
+	var ce *clierr.Error
+	if !errors.As(err, &ce) {
+		ce = clierr.Wrap(clierr.KindGeneric, err.Error(), err)
+	}
+	_ = r.RenderError(ce.ToEnvelope())
+	ce.MarkRendered()
+	return ce
+}
+
+func usageError(r *render.Renderer, msg string) error {
+	e := clierr.New(clierr.KindUsage, msg)
+	_ = r.RenderError(e.ToEnvelope())
+	e.MarkRendered()
+	return e
+}
+
+// parseHeaders parses repeatable -H "Name: Value" flags into a map, validating
+// each header (audit L-2): the name must be a non-empty RFC 7230 token and the
+// value must not contain CR or LF. Malformed input yields a usage error.
+func parseHeaders(hs []string) (map[string]string, error) {
+	if len(hs) == 0 {
+		return nil, nil
+	}
+	out := make(map[string]string, len(hs))
+	for _, h := range hs {
+		name, val, ok := strings.Cut(h, ":")
+		if !ok {
+			return nil, errString("invalid header (want 'Name: Value'): " + h)
+		}
+		name = strings.TrimSpace(name)
+		val = strings.TrimSpace(val)
+		if name == "" {
+			return nil, errString("invalid header (empty name): " + h)
+		}
+		if !isValidHeaderName(name) {
+			return nil, errString("invalid header name: " + name)
+		}
+		if strings.ContainsAny(val, "\r\n") {
+			return nil, errString("invalid header value (contains CR/LF) for: " + name)
+		}
+		out[name] = val
+	}
+	return out, nil
+}
+
+// isValidHeaderName reports whether name is a valid RFC 7230 header field-name
+// (a non-empty token).
+func isValidHeaderName(name string) bool {
+	for _, c := range name {
+		if !isTokenChar(c) {
+			return false
+		}
+	}
+	return true
+}
+
+// isTokenChar reports whether c is a valid RFC 7230 token character.
+func isTokenChar(c rune) bool {
+	switch {
+	case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
+		return true
+	}
+	return strings.ContainsRune("!#$%&'*+-.^_`|~", c)
+}
+
+func ptrOr(s *string, fallback string) string {
+	if s == nil {
+		return fallback
+	}
+	return *s
+}
+
+// --- small flag/error helpers -------------------------------------------------
+
+type errString string
+
+func (e errString) Error() string { return string(e) }
+
+func mustBool(f *pflag.FlagSet, name string) bool {
+	v, _ := f.GetBool(name)
+	return v
+}
+
+func mustDuration(f *pflag.FlagSet, name string) time.Duration {
+	v, _ := f.GetDuration(name)
+	return v
+}
+
+func mustStringArray(f *pflag.FlagSet, name string) []string {
+	v, _ := f.GetStringArray(name)
+	return v
+}
