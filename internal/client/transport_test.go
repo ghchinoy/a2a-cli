@@ -60,13 +60,15 @@ func TestSelectInterface_ExplicitOverride(t *testing.T) {
 }
 
 func TestSelectInterface_ExplicitNotOffered(t *testing.T) {
+	// A local request/card mismatch is a usage error (exit 2), not unreachable —
+	// no dial is attempted (review O1, EM decision).
 	c := card(a2a.TransportProtocolJSONRPC)
 	_, _, err := selectInterface(c, TransportHTTPJSON, "http://svc")
 	if err == nil {
 		t.Fatal("expected error when card lacks requested transport")
 	}
-	if clierr.ExitCode(err) != 3 {
-		t.Errorf("want unreachable(3), got exit %d", clierr.ExitCode(err))
+	if clierr.ExitCode(err) != 2 {
+		t.Errorf("want usage(2), got exit %d", clierr.ExitCode(err))
 	}
 }
 

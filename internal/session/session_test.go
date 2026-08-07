@@ -11,6 +11,7 @@ package session
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -65,6 +66,51 @@ func TestLoad_NoSessionReturnsNil(t *testing.T) {
 	}
 	if got != nil {
 		t.Errorf("expected nil session, got %+v", got)
+	}
+}
+
+func TestSave_StripsURLUserinfo(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", dir)
+
+	if err := Save(&Session{ServiceURL: "https://user:token@agent.example.com/a2a"}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(got.ServiceURL, "token") || strings.Contains(got.ServiceURL, "user:") {
+		t.Errorf("URL userinfo must not be persisted, got %q", got.ServiceURL)
+	}
+	if got.ServiceURL != "https://agent.example.com/a2a" {
+		t.Errorf("serviceUrl = %q, want stripped host URL", got.ServiceURL)
+	}
+}
+
+func TestSave_AtomicOverwriteKeeps0600(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", dir)
+	if err := Save(&Session{ContextID: "first"}); err != nil {
+		t.Fatal(err)
+	}
+	// Overwrite; the rename-based write must still leave a 0600 file.
+	if err := Save(&Session{ContextID: "second"}); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(filepath.Join(dir, "a2a-cli", "session.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if perm := info.Mode().Perm(); perm != 0o600 {
+		t.Errorf("session file mode after overwrite = %o, want 600", perm)
+	}
+	got, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ContextID != "second" {
+		t.Errorf("expected overwrite to persist latest, got %q", got.ContextID)
 	}
 }
 
