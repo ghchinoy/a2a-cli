@@ -1,57 +1,165 @@
 # a2a-cli
 
-A conformant **Tier-1** command-line client for the [A2A protocol](https://a2a-protocol.org),
-built on the official [`a2a-go` v2 SDK](https://github.com/a2aproject/a2a-go).
+A command-line client for talking to [A2A protocol](https://a2a-protocol.org) agents from your
+terminal: send a message to an agent, wait for its answer, and get the result as readable text or
+machine-readable JSON. Built on the official [`a2a-go` v2 SDK](https://github.com/a2aproject/a2a-go).
 
-> Status: **alpha** — Phase 1 (`send` vertical slice + walking skeleton). No
-> stability guarantees while the spec is Draft.
+> **Status: alpha.** This is an early build of a **Tier-1** A2A client. Only **Phase 1** is
+> implemented so far — the `send` command over HTTP+JSON. More commands (`discover`, `get`,
+> `cancel`, streaming, auth flows) land as later phases complete. The `--output json` shape and the
+> exit-code scheme are a stable contract; everything else may change without notice while the
+> [a2a-cli spec](https://github.com/a2aproject/a2a-cli) is still a Draft.
 
-## Install / build
+## Installation
+
+Requires **Go 1.26+**. Build from source:
 
 ```bash
-go build ./cmd/a2a-cli
+git clone https://github.com/ghchinoy/a2a-cli.git
+cd a2a-cli
+go build -o a2a-cli ./cmd/a2a-cli
 ```
+
+This produces an `a2a-cli` binary in the current directory. Move it onto your `PATH` (e.g.
+`sudo mv a2a-cli /usr/local/bin/`) to run it from anywhere. The examples below assume it is on your
+`PATH`.
 
 ## Usage
 
-Send a message to an agent and wait (blocking) for the result:
+Point `a2a-cli` at a running A2A agent with `-u` and send it a message. By default the command
+**blocks** until the agent finishes, then prints the result:
 
 ```bash
-# text output (default)
 a2a-cli send "hello" -u http://127.0.0.1:9001
+```
 
-# machine-readable Appendix B envelope on stdout
+```text
+State:     TASK_STATE_COMPLETED
+Task ID:   (none)
+Context:   (none)
+Message:   Hello from REST server!
+```
+
+Add `-o json` (or its shorthand `-n`) for machine-readable output on stdout — the normalized
+envelope defined by the spec. Diagnostics and warnings always go to stderr, so stdout stays clean
+for piping into `jq`:
+
+```bash
 a2a-cli send "hello" -u http://127.0.0.1:9001 -o json
 ```
 
-### Key flags (spec §5.2)
+```json
+{
+  "taskId": null,
+  "contextId": null,
+  "state": "TASK_STATE_COMPLETED",
+  "message": {
+    "role": "ROLE_AGENT",
+    "parts": [
+      {
+        "text": "Hello from REST server!"
+      }
+    ]
+  }
+}
+```
+
+`taskId` and `contextId` are `null` here because this agent replied with a direct **message** rather
+than opening a stateful **task**. When an agent creates a task, those fields carry the identifiers you
+use to continue the conversation.
+
+The most recent service URL is remembered (see [Session state](#session-state)), so after the first
+call you can usually drop `-u`:
+
+```bash
+a2a-cli send "and again"
+```
+
+For the full flag list, run `a2a-cli send --help`.
+
+### Commands
+
+| Command | Status | Purpose |
+|---|---|---|
+| `send` | ✅ available | Send a message to an agent and wait for the result |
+| `discover` | ⏳ planned | Fetch and inspect an agent card |
+| `get` | ⏳ planned | Retrieve a task's status and artifacts |
+| `cancel` | ⏳ planned | Cancel an active task |
+
+`help` and `completion` (shell completion) are provided by the CLI framework.
+
+### Global flags
+
+Flags are global — they attach to `send` today and to the commands still to come.
 
 | Flag | Meaning |
 |---|---|
-| `-u, --service-url` | Base URL of the A2A agent (required) |
-| `-o, --output` | Output format: `text` (default) or `json` |
-| `-n, --no-tui` | Shorthand for `--output json` |
-| `--transport` | `http-json` \| `jsonrpc` \| `grpc` (default: card-driven, HTTP+JSON) |
-| `--context-id`, `--task-id` | Continue a conversation / send against a task |
-| `--poll-interval` | Poll interval while waiting (default `2s`) |
-| `--timeout` | Max wait for a task (`0` = no timeout) |
-| `--a2a-version` | Protocol version to signal (default `1.0`) |
-| `--bearer`, `--api-key`, `-H` | Caller-supplied credentials |
-| `--insecure` | Skip TLS verification (warns) |
-| `-v, --verbose` | Verbose diagnostics on stderr |
+| `-u, --service-url <url>` | Base URL of the A2A agent. Optional if a previous run stored one. |
+| `--card-url <url>` | Explicit agent-card URL, overriding the well-known path. |
+| `-o, --output <text\|json>` | Output format. Default `text`. |
+| `-n, --no-tui` | Shorthand for `--output json`. |
+| `--transport <http-json\|jsonrpc\|grpc>` | Transport binding. Default: card-driven, HTTP+JSON. Only HTTP+JSON is functional in Phase 1. |
+| `--context-id <id>` | Continue an existing conversation. |
+| `--task-id <id>` | Send against an existing task. |
+| `--poll-interval <dur>` | Poll interval while waiting for a task. Default `2s`. |
+| `--timeout <dur>` | Maximum time to wait for a task. `0` means no timeout. |
+| `--a2a-version <ver>` | Protocol version to signal. Default `1.0`. |
+| `--bearer <token>` | Bearer token for the `Authorization` header. |
+| `--api-key <key>` | API key, sent as `X-API-Key`. |
+| `-H, --header <Name: Value>` | Extra request header. Repeatable. |
+| `--insecure` | Skip TLS certificate verification (prints a warning). |
+| `-v, --verbose` | Verbose diagnostics on stderr. |
 
-## Behavior
+Every flag with a default can also be set via an environment variable prefixed `A2A_CLI_`
+(for example `A2A_CLI_SERVICE_URL`). Precedence is: explicit flag → environment variable →
+stored session → built-in default.
 
-- **Transport** defaults to HTTP+JSON via card-driven selection; an explicit
-  `--transport` overrides, else the card's declared preference is honored.
-- **Blocking** by default: waits until the task reaches a terminal state, and
-  stops immediately on an interrupted state (`INPUT_REQUIRED` / `AUTH_REQUIRED`).
-- **Output discipline:** in `-o json`, stdout carries only the Appendix B
-  envelope; all diagnostics go to stderr.
-- **Exit codes** (spec §9.5): `0` success · `2` usage · `3` unreachable ·
+### Behavior
+
+- **Transport** defaults to HTTP+JSON, chosen from the agent card. An explicit `--transport`
+  overrides it; otherwise the card's declared preference is honored. gRPC is not yet supported and
+  is rejected with a usage error.
+- **Blocking by default:** `send` waits until the task reaches a terminal state and stops
+  immediately on an interrupted state (`INPUT_REQUIRED` / `AUTH_REQUIRED`).
+- **Output discipline:** in `-o json`, stdout carries only the envelope; all diagnostics go to
+  stderr.
+- **Exit codes** (spec §9.5): `0` success · `1` generic failure · `2` usage · `3` unreachable ·
   `4` auth · `5` task failed/rejected · `6` input required · `7` timeout.
-- **Session:** the most recent conversation is captured to
-  `$XDG_CONFIG_HOME/a2a-cli/session.json` (fallback `~/.config/a2a-cli/`).
+
+### Session state
+
+The most recent conversation (service URL and transport) is captured to
+`$XDG_CONFIG_HOME/a2a-cli/session.json` (falling back to `~/.config/a2a-cli/session.json`) so you
+can omit `-u` on the next call. Delete that file to clear it. Explicit flags and environment
+variables always override stored values.
+
+## Documentation
+
+- [User guide](docs/user_guide.md) — install, quickstart, and worked `send` examples.
+- [Test plan](docs/test-plan.md) — validation and Tier-1 conformance walkthrough for reviewers and
+  the conformance team.
+
+## Development
+
+```bash
+git clone https://github.com/ghchinoy/a2a-cli.git
+cd a2a-cli
+go build ./cmd/a2a-cli   # compile
+go test ./...            # run the unit tests
+```
+
+Requires the Go 1.26+ toolchain; no other services are needed for the unit tests. To exercise the
+CLI end to end, run it against a local A2A sample server — see the [test plan](docs/test-plan.md)
+for how to stand one up.
+
+The layout follows the design's package boundaries: `cmd/a2a-cli` (entry point) and `internal/`
+(`cli`, `client`, `envelope`, `render`, `poll`, `session`, `config`, `clierr`).
+
+## Contributing
+
+This is an early-stage project under active phased development. Issues and pull requests are welcome;
+for larger changes, please open an issue first to discuss the approach. Keep documentation aligned
+with merged behavior — docs describe what the code does today, not planned features.
 
 ## License
 
