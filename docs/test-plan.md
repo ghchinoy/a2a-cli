@@ -7,18 +7,22 @@ compliance-report** notion, so the team can execute it end to end at Phase 8 and
 The plan is intentionally comprehensive — it enumerates the full Tier-1 acceptance surface. Each
 step is clearly marked as either:
 
-- **✅ Exercisable now** — runnable against the current merged build (Phases 1–2: `send` and
-  `discover` over HTTP+JSON). Expected output below was captured from the built binary against the
-  live Go hello-world REST server.
+- **✅ Exercisable now** — runnable against the current merged build (Phases 1–6). Expected output
+  below was captured from the built binary run against the live Go hello-world sample servers (REST
+  and JSON-RPC).
+- **◑ Partial** — the command is merged and exercisable, but some facet of the criterion needs a
+  richer server (task-producing, auth-enforcing, or multi-version) that Tier-1 CI doesn't provision.
 - **⏳ Pending** — the criterion is specified but the code that satisfies it is not merged yet; the
   step names the phase (per design §9) that unlocks it.
 
-> **Merged surface at time of writing.** Phases 1–2 are on `main`: the `send` command, the
-> `discover` command (full card presentation, `--card-url`, `--validate`, surfaced card-driven
-> transport selection), global-flag parsing, card-driven HTTP+JSON transport selection, the JSON
-> envelope + error normalization, exit-code mapping, blocking wait, and session capture. `get` /
-> `cancel`, streaming, `--context-id` / `--task-id` continuation semantics, and the `SKILL.md` bundle
-> are not yet merged.
+> **Merged surface at time of writing.** Phases 1–6 are on `main`: `send` (with `--stream`),
+> `discover` (full card presentation, `--card-url`, `--validate`, surfaced card-driven transport
+> selection), `get` (`--include-artifacts`, `--history`, `--wait`/`--watch`), `cancel`, and the
+> `session` command (`show` / `clear`); card-driven transport selection over **HTTP+JSON and
+> JSON-RPC**; the JSON envelope + cross-binding error normalization; exit-code mapping; blocking
+> wait; `--continue` / `--last` continuation; caller-supplied auth with the cross-origin/downgrade
+> credential gate; `A2A-Version` signaling; and session capture (`0600`). The `SKILL.md` bundle
+> (Phase 7) and the TCK-backed compliance report (Phase 8) are not yet merged.
 
 ## Contents
 
@@ -60,15 +64,18 @@ go test ./...
 
 ## Standing up a sample server
 
-Tier-1 transport is **HTTP+JSON**. The reference server for this plan is the **Go hello-world REST**
-example from the `a2a-go` SDK — it is Go-only (keeps CI in one toolchain), needs no API key, and
-serves its card at the well-known path.
+The reference servers for this plan are the **Go hello-world** examples from the `a2a-go` SDK — Go
+only (keeps CI in one toolchain), no API key, card served at the well-known path. There are two: a
+**REST** (HTTP+JSON) server and a **JSON-RPC** server, so cross-binding parity can be checked with
+the Go toolchain alone. They are part of the `a2a-go` module `a2a-cli` already depends on, so you can
+build them straight from the module without a separate checkout:
 
 ```bash
-# from an a2a-go checkout
-cd a2a-go/examples/helloworld/server/rest
-go build -o /tmp/hw-rest .
-/tmp/hw-rest -port 9001 &        # listens on http://127.0.0.1:9001
+# from the a2a-cli checkout (uses the already-required a2a-go module)
+go build -o /tmp/hw-rest    github.com/a2aproject/a2a-go/v2/examples/helloworld/server/rest
+go build -o /tmp/hw-jsonrpc github.com/a2aproject/a2a-go/v2/examples/helloworld/server/jsonrpc
+/tmp/hw-rest    -port 9001 &     # HTTP+JSON, card at http://127.0.0.1:9001
+/tmp/hw-jsonrpc -port 9002 &     # JSON-RPC,  card at http://127.0.0.1:9002 (endpoint /invoke)
 ```
 
 Confirm the card is reachable:
@@ -81,10 +88,12 @@ curl -s http://127.0.0.1:9001/.well-known/agent-card.json
 {"supportedInterfaces":[{"url":"http://127.0.0.1:9001","protocolBinding":"HTTP+JSON","protocolVersion":"1.0"}],"capabilities":{"streaming":true},"defaultInputModes":["text"],"defaultOutputModes":["text"],"description":"Just a rest hello world agent","name":"REST Hello World Agent","skills":[{"description":"Returns a 'Hello from REST server!'","examples":["hi","hello"],"id":"hello_world","name":"REST Hello world!","tags":["hello world"]}],"version":""}
 ```
 
-This agent replies with a **direct message** (not a stateful task), so `taskId`/`contextId` are
-`null` and the state is `TASK_STATE_COMPLETED`. That is sufficient to validate the Phase-1 slice, but
-it cannot produce task-only states (`WORKING`, `INPUT_REQUIRED`, `FAILED`, artifacts). Steps that
-need those are marked **⏳ Pending** and require either a later phase and/or a richer server.
+Both Go servers reply with a **direct message** (not a stateful task), so `taskId`/`contextId` are
+`null` and the state is `TASK_STATE_COMPLETED`. That is sufficient to validate `send`/`discover`/
+`--stream` and the command surface, but neither server maintains a task store, so `get`/`cancel`
+against a **real** task cannot be exercised here — only their `NOT_FOUND` path is (a known task id
+never exists). Task-only states (`WORKING`, `INPUT_REQUIRED`, `FAILED`, artifacts) likewise cannot be
+produced. Steps that need those are marked **◑ Partial** / **⏳ Pending** and require a richer server.
 
 > **Note on the Python multi-transport server.** The `a2a-python` hello-world server exposes all
 > three transports and both protocol versions at once and is the natural fixture for cross-transport
@@ -179,12 +188,12 @@ a2a-cli discover -u http://127.0.0.1:9001 -o json | jq .selection.transport   # 
 ```
 
 `--card-url` targets a card off the well-known path, and `--validate` checks the card's
-required-field structure (a conformance aid, not a security check), printing a note to **stderr** and
-still presenting a valid card:
+required-field **structure** (a conformance aid — required-field/shape only, not a full JSON-Schema
+validation and not a security check), printing a note to **stderr** and still presenting a valid card:
 
 ```bash
 a2a-cli discover -u http://127.0.0.1:9001 --validate 2>&1 1>/dev/null
-# -> card is valid against the A2A card schema
+# -> card passed structural validation (required fields present; not a full JSON-Schema or security check)
 ```
 
 `discover` honors card-driven transport selection: an explicit `--transport http-json` reports
@@ -194,18 +203,61 @@ because the card doesn't advertise it (exit `2`, `Error [USAGE]: agent card does
 jsonrpc`). An unreachable target exits `3` with a normalized `UNREACHABLE` error, and calling
 `discover` with neither `-u` nor `--card-url` is a usage error (exit `2`).
 
-**⏳ Pending — `get` + `cancel` (Phase 3).** These commands are not merged. Verify their absence:
+**✅ Exercisable now — commands present (Phase 3+):** `get`, `cancel`, and `session` are merged and
+appear in the command tree:
 
 ```bash
-a2a-cli --help    # Available Commands: completion, discover, help, send
+a2a-cli --help    # Available Commands: cancel, completion, discover, get, help, send, session
 ```
 
-`get` and `cancel` should **not** appear. Re-run T2 in full once Phase 3 lands.
+**✅ Exercisable now — `get` (Phase 3):** `get <taskId>` is a one-shot task fetch. Neither Go server
+keeps a task store, so a known id never resolves — this exercises the normalized `NOT_FOUND` path
+(the real-task/artifacts/history paths need a task-producing server, below):
+
+```bash
+a2a-cli get some-task-id -u http://127.0.0.1:9001 -o json
+```
+
+Expected (exit `1`):
+
+```json
+{
+  "code": "NOT_FOUND",
+  "message": "get task failed: failed to get task: task not found",
+  "a2aCode": "TASK_NOT_FOUND"
+}
+```
+
+`--history` is guarded client-side: a negative value is a usage error (exit `2`, server never
+reached), and an absurd value is clamped to `1000` with a stderr warning (CO-8):
+
+```bash
+a2a-cli get some-task-id -u http://127.0.0.1:9001 --history -5      # -> Error [USAGE]: --history must be zero or a positive number (exit 2)
+a2a-cli get some-task-id -u http://127.0.0.1:9001 --history 99999   # -> stderr: --history 99999 exceeds the client maximum of 1000; clamping to 1000
+```
+
+`--include-artifacts` (fetch artifact contents vs the default summary), `--wait`/`--watch` (poll to a
+terminal/interrupted state, reusing the same loop as `send`), and `--poll-interval`/`--timeout` are
+all accepted (`a2a-cli get --help`).
+
+**✅ Exercisable now — `cancel` (Phase 3):** `cancel <taskId>` is idempotent and reports the
+resulting state; a successful cancel exits `0`. Against the store-less servers an unknown id
+exercises the same normalized `NOT_FOUND` path (exit `1`):
+
+```bash
+a2a-cli cancel some-task-id -u http://127.0.0.1:9001
+# -> Error [NOT_FOUND]: cancel failed: ...task not found   (exit 1)
+```
 
 - ✅ `discover` full-card presentation, `-o json` envelope, `--card-url`, `--validate`, and surfaced
   transport selection — verified against the built binary.
+- ✅ `get`/`cancel` present, flag surface, and the `NOT_FOUND` normalization (identical over HTTP+JSON
+  **and** JSON-RPC — point either command at `http://127.0.0.1:9002`) — verified.
+- ◑ `get` against a **real** task (state/artifacts/history rendering), `get --wait` polling to
+  terminal, and `cancel` moving a live task to `CANCELED` need a **task-producing** server; the Go
+  hello-world servers reply with a message and keep no task store.
 - ⏳ `discover` against a **multi-interface** card (preference ordering, routing identifier) needs the
-  Tier-2 Python fixture — the hello-world card declares a single HTTP+JSON interface.
+  Tier-2 Python fixture — the hello-world cards each declare a single interface.
 
 ### T3 — JSON envelope (AC 3)
 
@@ -265,10 +317,37 @@ a2a-cli send "hello" -u http://127.0.0.1:9001 -o json --insecure 2>/dev/null | j
 Expected (exit `0`): `"TASK_STATE_COMPLETED"` on stdout; the `--insecure` warning appears only when
 stderr is not discarded.
 
-- ✅ Envelope top-level fields, error object shape, stdout/stderr split — verified.
-- ⏳ `artifacts` array population and NDJSON streaming events require artifacts/streaming (Phases 3/5).
-- ⏳ Cross-**binding** identical error codes: only HTTP+JSON is functional now, so equality across
-  JSON-RPC/gRPC is untestable until ≥2 transports are live (Tier 2).
+**✅ Exercisable now — NDJSON stream (Phase 5):** with `--stream -o json`, stdout is
+newline-delimited JSON — one object per line, each tagged with `type`, ending in a `final` record
+carrying the Appendix B task fields:
+
+```bash
+a2a-cli send "hello" -u http://127.0.0.1:9001 --stream -o json
+```
+
+Expected (exit `0`):
+
+```json
+{"type":"message","taskId":null,"contextId":null,"state":"","message":{"role":"ROLE_AGENT","parts":[{"text":"Hello from REST server!"}]}}
+{"type":"final","taskId":null,"contextId":null,"state":"TASK_STATE_COMPLETED","message":{"role":"ROLE_AGENT","parts":[{"text":"Hello from REST server!"}]}}
+```
+
+**✅ Exercisable now — cross-binding error equality (Phase 6):** the same A2A error yields the same
+normalized envelope regardless of binding. `get`/`cancel` for an unknown task returns identical
+`code`/`a2aCode` over HTTP+JSON (`:9001`) and JSON-RPC (`:9002`):
+
+```bash
+a2a-cli get missing -u http://127.0.0.1:9001 -o json | jq -c '{code,a2aCode}'   # {"code":"NOT_FOUND","a2aCode":"TASK_NOT_FOUND"}
+a2a-cli get missing -u http://127.0.0.1:9002 -o json | jq -c '{code,a2aCode}'   # {"code":"NOT_FOUND","a2aCode":"TASK_NOT_FOUND"}
+```
+
+- ✅ Envelope top-level fields, error object shape, stdout/stderr split, and NDJSON stream records —
+  verified.
+- ✅ Cross-**binding** identical error codes — verified across the two live Go bindings (HTTP+JSON and
+  JSON-RPC) for the `NOT_FOUND` case. gRPC is out of scope (not supported); broader cross-binding
+  coverage across every error awaits the Tier-2 multi-transport fixture.
+- ◑ `artifacts` array population needs an artifact-producing server; the Go hello-world servers emit
+  a message with no artifacts.
 
 ### T4 — Exit codes (AC 4)
 
@@ -279,9 +358,11 @@ stderr is not discarded.
 | Code | Trigger | Command | Verified |
 |---|---|---|---|
 | `0` | Task completed | `a2a-cli send "hi" -u http://127.0.0.1:9001` | ✅ |
+| `1` | Generic / not-found | `a2a-cli get missing -u http://127.0.0.1:9001` → `Error [NOT_FOUND]: ...task not found` (envelope `code=NOT_FOUND`; no dedicated numeric slot ⇒ exit `1`, CO-2) | ✅ |
 | `2` | Usage error | `a2a-cli send -u http://127.0.0.1:9001` (no message arg) → `Error [USAGE]: send requires exactly one <text> argument` | ✅ |
 | `2` | Usage error | `a2a-cli send "hi" -u http://127.0.0.1:9001 --transport grpc` → `Error [USAGE]: transport not supported at Tier 1: grpc` | ✅ |
 | `2` | Usage error | `a2a-cli send "hi" -u http://127.0.0.1:9001 -o yaml` → `Error [USAGE]: invalid --output value "yaml" (want one of: text, json, tui)` | ✅ |
+| `2` | Usage error | `a2a-cli get t -u http://127.0.0.1:9001 --history -5` → `Error [USAGE]: --history must be zero or a positive number` | ✅ |
 | `3` | Unreachable | `a2a-cli send "hi" -u http://127.0.0.1:9999` → `Error [UNREACHABLE]: ...connection refused` | ✅ |
 
 Check a code explicitly:
@@ -290,13 +371,19 @@ Check a code explicitly:
 a2a-cli send -u http://127.0.0.1:9001 ; echo "exit=$?"   # exit=2
 ```
 
-**⏳ Pending — codes not reachable against the hello-world agent:**
+**◑ Partial — codes not reachable against the message-only Go servers:**
 
-- `1` generic — reachable (e.g. sending `--task-id <missing>` yields a generic error today), but the
-  clean not-found path is a continuation concern (Phase 4). See [items of concern](#items-of-concern).
-- `4` auth, `5` task failed/rejected, `6` input required, `7` timeout — require an agent that returns
-  those states or a long-running task. Validate against a richer server once continuation/streaming
-  land (Phases 3–6). The mapping itself is implemented (`internal/clierr`) and unit-tested.
+- `4` auth — reachable only against an **auth-enforcing** agent (a bad credential → `401` → exit `4`);
+  the Go hello-world servers require no auth. The `UNAUTHENTICATED`/`AUTH_REQUIRED` → exit `4` mapping
+  is implemented (`internal/client` classify) and unit-tested.
+- `5` task failed/rejected, `6` input required, `7` timeout — require an agent that returns those
+  states or a long-running task. The mapping (`internal/clierr`) is implemented and unit-tested;
+  end-to-end validation needs a task-producing / interruptible server.
+
+> **Note (CO-2):** a task the server doesn't know is a firm envelope contract — `code=NOT_FOUND`,
+> `a2aCode=TASK_NOT_FOUND` across every binding — but §9.5 has **no dedicated numeric slot** for
+> not-found, so the process exit is the generic `1`. This is verified above and is intentional, not a
+> gap.
 
 ### T5 — Conversation / session (AC 5)
 
@@ -330,17 +417,46 @@ This confirms state is persisted to disk (not memory-only) and replayed. An expl
 text and `state`/`taskId`/`contextId` in JSON (T1/T3). With the hello-world message reply the ids are
 `(none)`/`null`; the tool never invents them.
 
+**✅ Exercisable now — `--task-id` surfaces the server error, not a silent new task (Phase 4/6):**
+sending against an unknown task id surfaces the normalized `NOT_FOUND` error rather than quietly
+opening a new task (spec §6.2):
+
+```bash
+a2a-cli send "reply" -u http://127.0.0.1:9001 --task-id nonexistent
+# -> Error [NOT_FOUND]: send failed: ...task not found   (exit 1)
+```
+
+**✅ Exercisable now — `--continue` / `--last` (Phase 4):** both are named flags, and both are
+opt-in so a bare `send` never attaches to a stale task. With no stored session they are a usage error
+(exit `2`); with a session that recorded no task, `--last` warns and sends a new message:
+
+```bash
+a2a-cli session clear
+a2a-cli send "hi" --continue
+# -> Error [USAGE]: no stored session to resume (--continue/--last); run a send first or pass --context-id/--task-id  (exit 2)
+```
+
+**✅ Exercisable now — `session` command + `0600` store (Phase 4):** `session show` prints the store
+path and contents; `session clear` deletes it (idempotent); the file is written `0600`:
+
+```bash
+a2a-cli send "hi" -u http://127.0.0.1:9001        # writes the store
+stat -c '%a' ~/.config/a2a-cli/session.json       # -> 600
+a2a-cli session show                              # path + contextId/latestTaskId/serviceUrl/transport
+a2a-cli session clear                             # -> session cleared: <path>
+```
+
 **⏳ Pending:**
 
-- Full `--context-id` / `--task-id` continuation **semantics** (surface server not-found/state
-  conflict rather than silently starting a new task) — Phase 4. The flags parse today, but against a
-  message-only agent there is no task to continue.
-- **Resume-command hint** (`a2a-cli send --task-id <id> "<reply>"`) on interruption — Phase 4, needs
-  an interruptible task.
-- `--continue` / `--last` explicit flags — Phase 4 (today the session auto-supplies the last URL, but
-  there is no named `--continue` flag yet).
-- **`0600` secret file** enforcement — Tier 1 does not persist secrets (caller-supplied creds are not
-  stored); the mode-restricted `credentials.json` is a Tier-2 concern.
+- **Full continuation replay** against a **task-aware** server (a real `contextId`/`taskId` echoed
+  back and replayed on the next turn) — the Go hello-world servers reply with a message and open no
+  task, so there is no live task to continue. The `--task-id` not-found guard above is verified; the
+  positive replay path needs a richer server.
+- **Resume-command hint** on **interruption** (`INPUT_REQUIRED` → `a2a-cli send --task-id <id>
+  "<reply>"`) — needs an interruptible task; the hint code path is unit-tested.
+- **`0600` secret file** for persisted credentials — Tier 1 does not persist caller-supplied creds;
+  the mode-restricted `credentials.json` is a Tier-2 concern. The `session.json` store is already
+  `0600` (verified above).
 
 ### T6 — Polling (AC 6)
 
@@ -349,14 +465,20 @@ text and `state`/`taskId`/`contextId` in JSON (T1/T3). With the hello-world mess
 if streaming implemented, first event is `Task` and post-reconnect reconciles with `get` (design
 §10.6, spec §7).
 
-**✅ Exercisable now — flags present and defaulted:** `--poll-interval` (default `2s`) and
-`--timeout` (default `0` = no timeout) are accepted on `send` (`a2a-cli send --help`). Blocking to a
-terminal state is verified in T1.
+**✅ Exercisable now — flags and poll entry points present (Phases 3/5):** `--poll-interval`
+(default `2s`) and `--timeout` (default `0` = no timeout) are accepted on `send` and `get`. The poll
+loop is reachable two ways beyond `send`'s blocking wait: `get --wait`/`--watch` (poll a task to a
+terminal/interrupted state, `--watch` reporting each transition on stderr) and `send --stream` (which
+reconciles with a `get` after any stream (re)connect and **falls back to the poll loop** if the
+stream drops). Blocking to a terminal state is verified in T1; NDJSON stream records in T3.
 
-**⏳ Pending:** the polling loop's interrupted-state stop, `--timeout` → exit `7` with the `taskId`
-preserved, and SIGINT interruptibility all need a long-running / task-producing agent — the
-hello-world agent completes instantly. Validate at Phase 3 (`get --wait` poll loop) / Phase 5
-(streaming). The wait logic in `internal/poll` is unit-tested.
+**◑ Partial / ⏳ Pending:** the polling loop's **interrupted-state stop**, `--timeout` → exit `7`
+with the `taskId` preserved, SIGINT interruptibility, and a **forced stream drop → poll fallback →
+reconcile** all need a **long-running / task-producing** agent — the Go hello-world servers complete
+instantly with a message and open no task. The wait/reconcile logic (`internal/poll`, the
+`send --stream` fallback in `internal/cli`) is unit-tested; end-to-end validation needs a richer
+server. The `send --stream` no-attempt gate (card without streaming → blocking path) is also
+unit-tested but not reproducible here, since both Go cards advertise `streaming: true`.
 
 ### T7 — Transport & version (AC 7)
 
@@ -364,19 +486,24 @@ hello-world agent completes instantly. Validate at Phase 3 (`get --wait` poll lo
 when declared; `A2A-Version` set on every request; version-unsupported surfaced clearly (design
 §10.7, spec §11).
 
-**✅ Exercisable now — card-driven selection & explicit override:**
+**✅ Exercisable now — card-driven selection, both live bindings, & explicit override:**
 
 ```bash
+a2a-cli send "hi" -u http://127.0.0.1:9001                         # HTTP+JSON card -> exit 0
+a2a-cli send "hi" -u http://127.0.0.1:9002                         # JSON-RPC card  -> exit 0 ("Hello, world!")
 a2a-cli send "hi" -u http://127.0.0.1:9001 --transport http-json   # exit 0, works
+a2a-cli send "hi" -u http://127.0.0.1:9002 --transport jsonrpc     # exit 0, works
 a2a-cli send "hi" -u http://127.0.0.1:9001 --transport grpc        # exit 2
 # -> Error [USAGE]: transport not supported at Tier 1: grpc
-a2a-cli send "hi" -u http://127.0.0.1:9001 --transport jsonrpc     # exit 2
+a2a-cli send "hi" -u http://127.0.0.1:9001 --transport jsonrpc     # exit 2 (card offers only HTTP+JSON)
 # -> Error [USAGE]: agent card does not offer transport jsonrpc
 ```
 
-The last case confirms the client selects from the card's declared interfaces and rejects a binding
-the card doesn't offer, rather than assuming one. `discover` makes the same selection visible without
-sending a message — its `Selected transport` line reports the chosen binding, URL, and reason (see
+Both **HTTP+JSON and JSON-RPC are functional live paths** — the client selects each from its card and
+round-trips a message. gRPC is rejected (not supported). The mismatch cases confirm the client
+selects from the card's declared interfaces and rejects a binding the card doesn't offer, rather than
+assuming one. `discover` makes the same selection visible without sending a message — for the
+JSON-RPC card it reports `Selected transport: jsonrpc -> http://127.0.0.1:9002/invoke` (see
 [T2](#t2--commands-ac-2)).
 
 **✅ Exercisable now — version signaling:** the default `--a2a-version` is `1.0` (`send --help`); the
@@ -385,9 +512,12 @@ headers** — so confirming the `A2A-Version` header on the wire requires a head
 (e.g. `mitmproxy`) or `tcpdump` in front of the agent. The signaling logic is implemented and
 unit-tested in `internal/client`.
 
-**⏳ Pending:** honoring a multi-interface **preference order**, echoing a **routing identifier**, and
-surfacing a clear **`VersionNotSupportedError`** need a multi-interface / version-strict server
-(Tier-2 Python fixture). Only HTTP+JSON is functional now.
+**◑ Partial / ⏳ Pending:** honoring a multi-interface **preference order** and echoing a **routing
+identifier** need a single card that declares several interfaces — each Go card declares one, so
+cross-transport parity is checked by pointing at the two servers rather than by one multi-interface
+card. Surfacing a clear **version-unsupported** error (exit `1`, `a2aCode` `VERSION_NOT_SUPPORTED`,
+never a silent downgrade) needs a **version-strict** server; the classification is implemented
+(`internal/client` classify) and unit-tested. These use the Tier-2 Python multi-transport fixture.
 
 ### T8 — Auth (AC 8)
 
@@ -406,8 +536,16 @@ The Go sample server logs only method, path, and body — **not headers** — so
 header-inspecting proxy (e.g. `mitmproxy`) or `tcpdump`. Env equivalents (`A2A_CLI_BEARER`,
 `A2A_CLI_API_KEY`) feed the same path. Credential construction is unit-tested in `internal/client`.
 
+**✅ Exercisable now — cross-origin/downgrade credential gate (Phase 6, CO-7):** credentials attach
+per request to a same-origin target, but are **withheld** from a cross-origin or downgraded
+(`https`→`http`) interface unless `--allow-cross-origin-credentials` is passed; the card fetch never
+carries credentials. Against the Go servers the selected interface is same-origin with the card, so
+creds attach silently and the flag is a no-op — the withhold/opt-in decision and its warnings are
+unit-tested (`internal/client`). The flag is present (`a2a-cli --help`) and defaults off.
+
 **⏳ Pending:** full validation against an **auth-enforcing** agent (correct 401 → exit `4` on bad
-creds, success on good creds) needs a server that gates on credentials — Phase 6 / a richer fixture.
+creds, success on good creds) and a **cross-origin card** (to trigger the withhold warning live) both
+need a richer fixture than the no-auth, single-origin Go servers.
 
 ### T9 — SKILL.md (AC 9)
 
@@ -432,20 +570,25 @@ command enumeration, and it restates no normative requirements.
 
 Mapping design §10 Tier-1 acceptance criteria to this plan and to the current merged build:
 
-| AC (design §10) | Test | Status against merged build | Unlocked by |
+| AC (design §10) | Test | Status against merged build (Phases 1–6) | Remaining work needs |
 |---|---|---|---|
-| 1 — Defaults (§4.5) | [T1](#t1--defaults-ac-1) | ◑ Partial — HTTP+JSON / blocking / text / TLS / v1.0 verified; interrupted-stop pending | Phases 3–4 |
-| 2 — Commands `discover`/`send`/`get`/`cancel` (§8.1–8.4) | [T2](#t2--commands-ac-2) | ◑ Partial — `send` + `discover` verified; `get`/`cancel` pending | Phase 3 |
-| 3 — JSON envelope (Appendix B, §9.3) | [T3](#t3--json-envelope-ac-3) | ◑ Partial — success + error envelope + stdout/stderr verified; artifacts/NDJSON/cross-binding pending | Phases 3/5, Tier 2 |
-| 4 — Exit codes 0–7 (§9.5) | [T4](#t4--exit-codes-ac-4) | ◑ Partial — 0/2/3 verified; 1/4/5/6/7 mapped + unit-tested, not yet triggerable end to end | Phases 3–6 |
-| 5 — Conversation/session (§6) | [T5](#t5--conversation--session-ac-5) | ◑ Partial — capture/replay + report-back verified; continuation semantics, resume hint, `--continue` pending | Phase 4 |
-| 6 — Polling (§7) | [T6](#t6--polling-ac-6) | ◑ Partial — flags present, terminal-wait verified; interrupted-stop/timeout/SIGINT pending | Phases 3/5 |
-| 7 — Transport & version (§11) | [T7](#t7--transport--version-ac-7) | ◑ Partial — card-driven selection + override + v1.0 signaling verified; preference order/routing id/version error pending | Tier 2 |
-| 8 — Auth (§10.1) | [T8](#t8--auth-ac-8) | ◑ Partial — flags/headers built + unit-tested; enforcement pending | Phase 6 |
+| 1 — Defaults (§4.5) | [T1](#t1--defaults-ac-1) | ◑ Partial — HTTP+JSON / blocking / text / TLS / v1.0 verified; interrupted-stop needs a task server | Task-producing server |
+| 2 — Commands `discover`/`send`/`get`/`cancel` (§8.1–8.4) | [T2](#t2--commands-ac-2) | ◑ Partial — all four commands + `session` merged; `send`/`discover`/`get`/`cancel` surface & `NOT_FOUND` verified over both bindings; real-task `get`/`cancel` need a task server | Task-producing server |
+| 3 — JSON envelope (Appendix B, §9.3) | [T3](#t3--json-envelope-ac-3) | ◑ Partial — success + error envelope, stdout/stderr, NDJSON stream, and cross-binding `NOT_FOUND` equality verified; artifact population pending | Artifact-producing server |
+| 4 — Exit codes 0–7 (§9.5) | [T4](#t4--exit-codes-ac-4) | ◑ Partial — 0/1/2/3 verified end to end; 4/5/6/7 mapped + unit-tested | Auth-enforcing / task server |
+| 5 — Conversation/session (§6) | [T5](#t5--conversation--session-ac-5) | ◑ Partial — capture/replay, report-back, `--continue`/`--last`, `session` show/clear, `0600`, and `--task-id` not-found guard verified; positive replay + interruption hint pending | Task-producing server |
+| 6 — Polling (§7) | [T6](#t6--polling-ac-6) | ◑ Partial — flags, `get --wait`/`--watch`, and `send --stream` reconcile/fallback merged; terminal-wait verified; interrupted-stop/timeout/SIGINT/forced-drop pending | Long-running / task server |
+| 7 — Transport & version (§11) | [T7](#t7--transport--version-ac-7) | ◑ Partial — card-driven selection + override over **HTTP+JSON and JSON-RPC** + v1.0 signaling verified; multi-interface preference/routing id/version-error pending | Multi-interface / version-strict server |
+| 8 — Auth (§10.1) | [T8](#t8--auth-ac-8) | ◑ Partial — flags/headers + cross-origin credential gate built & unit-tested; live enforcement pending | Auth-enforcing / cross-origin server |
 | 9 — SKILL.md (§12) | [T9](#t9--skillmd-ac-9) | ✗ Not merged | Phase 7 |
 | 10 — Compliance report (§13) | [T10](#t10--compliance-report-ac-10) | ✗ Not merged | Phase 8 |
 
 Legend: ✅ full · ◑ partial · ✗ not present.
+
+The predominant `◑ Partial` reflects a **complete, verified command surface** whose remaining gaps
+are almost all one thing: the Go hello-world servers reply with a message and keep no task store, so
+task-only states, artifacts, and continuation replay can't be produced. Those await the Tier-2 Python
+multi-transport fixture (and an auth-enforcing server), per design §7 Q5 — not further Tier-1 code.
 
 ## The §13 compliance report
 
@@ -460,19 +603,29 @@ report must state:
 - **transports covered** — HTTP+JSON at Tier 1;
 - conformance to the **conversation/session (§6)** and **polling (§7)** requirements.
 
-Until Phases 3–8 land, only the `send` and `discover` / HTTP+JSON rows of this report are
-exercisable; the coverage matrix above is the interim record of what has been validated against the
-merged build.
+With Phases 1–6 merged, the per-command surface (`discover`, `send`, `get`, `cancel`) is exercisable
+over both HTTP+JSON and JSON-RPC, and the coverage matrix above is the interim record of what has
+been validated against live Go servers. The TCK-backed rows (per-command pass/fail under the TCK,
+TCK version, §6/§7 conformance against task-producing states) still await Phases 7–8 and the Tier-2
+Python fixture; the compliance report itself is produced at Phase 8.
 
 ## Items of concern
 
 Observations from validating the merged build, flagged for the lead/reviewer:
 
-1. **`--task-id <missing>` returns a raw generic error (exit `1`).** Against the sample server,
-   `--task-id nonexistent` yields `code: "GENERIC"` with the SDK's `"task not found"` message rather
-   than a normalized `NOT_FOUND` code. Full continuation semantics (spec §6.2, "surface server error,
-   not silently start a new task") are a Phase 4 concern; noting that the current code path surfaces
-   the error but does not yet normalize it.
-2. **No `--continue` / `--last` flag yet.** Session auto-supplies the last service URL, which covers
-   part of spec §6.4, but the named flag is not present. Expected at Phase 4 — documented as pending,
-   not as working.
+1. **`--task-id <missing>` now normalizes to `NOT_FOUND` (resolved).** The Phase-2-era concern —
+   that `--task-id nonexistent` surfaced a raw `code: "GENERIC"` — is fixed. It now yields the
+   normalized `code: "NOT_FOUND"` / `a2aCode: "TASK_NOT_FOUND"` and exits `1`, surfacing the server
+   error rather than silently opening a new task (spec §6.2). Verified over both bindings.
+2. **`--continue` / `--last` flags now present (resolved).** Both named flags exist and are opt-in;
+   with no stored session they are a usage error, and `--last` without a stored task warns and sends
+   a new message. See [T5](#t5--conversation--session-ac-5).
+3. **Stored transport interacts with a fresh `-u` (CO-9, Tier-2 follow-up).** `session.json` persists
+   `transport` as well as `serviceUrl`; per §4.5 per-field precedence, pointing a later `send` at a
+   different server with `-u` but without `--transport` re-applies the stored transport, which fails
+   with `Error [USAGE]: agent card does not offer transport <stored>` (exit `2`) until the session is
+   cleared. Documented in the user guide as a precedence interaction (pass `--transport` or
+   `session clear` when switching servers); tracked as Tier-2 follow-up CO-9, not a Tier-1 blocker.
+4. **`CANCELED` → exit code.** `cancel` intentionally exits `0` on success (including an
+   already-terminal task); the general `CANCELED` → exit-code mapping for `get`/`send` is a known
+   open item the build lead flagged for the cross-binding numeric mapping. Noted for the reviewer.

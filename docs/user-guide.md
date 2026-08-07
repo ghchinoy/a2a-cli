@@ -3,11 +3,14 @@
 This guide gets a new user from nothing to a working round-trip against an A2A agent, then walks
 through the options that matter day to day.
 
-> **What works today.** `a2a-cli` is in **alpha**. Two commands of the Tier-1 build are merged: the
-> **`send`** command and the **`discover`** command, both over the **HTTP+JSON** transport. Commands
-> such as `get` and `cancel`, plus streaming and interactive OAuth login, are planned for later
-> phases and are **not** available yet. Everything in this guide has been verified against the built
-> binary; nothing here is aspirational. As more of Tier 1 lands, this guide grows with it.
+> **What works today.** `a2a-cli` is in **alpha**, but the full Tier-1 command set is merged:
+> **`send`** (with `--stream`), **`discover`**, **`get`**, **`cancel`**, and **`session`**, over the
+> **HTTP+JSON** and **JSON-RPC** transports, plus caller-supplied authentication. gRPC, a bundled
+> agent skill, and interactive OAuth login are **not** available yet. Every runnable example below
+> was captured from the built binary run against a live Go sample server. A few behaviors that need
+> a richer fixture — auth enforcement, protocol-version negotiation, cross-origin credential
+> handling, and exit codes 4–7 — are described from the spec and implementation (unit-tested) and
+> are tracked in the [test plan](test-plan.md).
 
 ## Contents
 
@@ -17,8 +20,13 @@ through the options that matter day to day.
 - [Understanding the output](#understanding-the-output)
 - [Text vs JSON](#text-vs-json)
 - [Inspecting an agent with `discover`](#inspecting-an-agent-with-discover)
+- [Retrieving a task with `get`](#retrieving-a-task-with-get)
+- [Cancelling a task with `cancel`](#cancelling-a-task-with-cancel)
+- [Streaming with `--stream`](#streaming-with---stream)
 - [Choosing the target agent](#choosing-the-target-agent)
 - [Session state and omitting `-u`](#session-state-and-omitting--u)
+- [Continuing a conversation](#continuing-a-conversation)
+- [Managing the session store](#managing-the-session-store)
 - [Credentials](#credentials)
 - [Transport and protocol version](#transport-and-protocol-version)
 - [Exit codes](#exit-codes)
@@ -239,21 +247,131 @@ a2a-cli discover -u http://127.0.0.1:9001 -o json
 
 ### Validating a card
 
-Pass `--validate` to check the card against the A2A card schema's required-field structure before you
-trust it. It's a conformance aid — a required-field / shape check, **not** a full JSON-Schema
-validation and **not** a security check (it does not vet URLs, credentials, or trust). A valid card
-still prints normally, with a note on stderr:
+Pass `--validate` to check the card's **required-field structure** before you trust it. It's a
+conformance aid — a required-field / shape check, **not** a full JSON-Schema validation and **not** a
+security check (it does not vet URLs, credentials, or trust). A valid card still prints normally,
+with a note on stderr:
 
 ```bash
 a2a-cli discover -u http://127.0.0.1:9001 --validate
 ```
 
 ```text
-card is valid against the A2A card schema
+card passed structural validation (required fields present; not a full JSON-Schema or security check)
 ```
 
-If the card is missing required fields, `discover` reports the problems and exits non-zero instead of
-presenting the card.
+If the card is missing required fields (name, description, at least one interface with a URL and
+protocol binding, or a skill's id/name), `discover` reports each problem and exits non-zero instead
+of presenting the card.
+
+## Retrieving a task with `get`
+
+When an agent opens a stateful **task**, it returns a `taskId`. `get <taskId>` retrieves that task's
+current state by id:
+
+```bash
+a2a-cli get <taskId> -u http://127.0.0.1:9001
+```
+
+By default `get` **summarizes** artifacts (it keeps their identifiers and names but drops their
+contents). Pass `--include-artifacts` to fetch the full contents, and `--history <n>` to include up
+to `n` recent history messages:
+
+```bash
+a2a-cli get <taskId> -u http://127.0.0.1:9001 --include-artifacts --history 20
+```
+
+`--history` guards its input: a **negative** value is a usage error (exit `2`) and the server is
+never contacted, while an absurdly large value is **clamped to 1000** with a warning on stderr:
+
+```bash
+a2a-cli get <taskId> -u http://127.0.0.1:9001 --history -5
+```
+
+```text
+Error [USAGE]: --history must be zero or a positive number
+```
+
+```bash
+a2a-cli get <taskId> -u http://127.0.0.1:9001 --history 99999
+```
+
+```text
+--history 99999 exceeds the client maximum of 1000; clamping to 1000
+```
+
+`get` is one-shot by default. Add `--wait` to poll until the task reaches a terminal or interrupted
+state (reusing the same blocking-wait logic as `send`), or `--watch` to additionally print each
+state transition to stderr. `--poll-interval` and `--timeout` tune the loop.
+
+If the server doesn't know the task, `get` surfaces a normalized `NOT_FOUND` error. The process exit
+is `1` (there is no dedicated numeric exit code for not-found at Tier 1), but the machine-readable
+envelope still carries the precise codes:
+
+```bash
+a2a-cli get missing-task-id -u http://127.0.0.1:9001 -o json
+```
+
+```json
+{
+  "code": "NOT_FOUND",
+  "message": "get task failed: failed to get task: task not found",
+  "a2aCode": "TASK_NOT_FOUND"
+}
+```
+
+## Cancelling a task with `cancel`
+
+`cancel <taskId>` requests cancellation of a task and reports the resulting state. It is
+**idempotent**: cancelling an already-terminal task is a clean no-op that reports the task's current
+state rather than erroring, and a successful cancel exits `0`.
+
+```bash
+a2a-cli cancel <taskId> -u http://127.0.0.1:9001
+```
+
+As with `get`, an unknown task surfaces as a `NOT_FOUND` envelope (`a2aCode: TASK_NOT_FOUND`) and
+exits `1`:
+
+```bash
+a2a-cli cancel missing-task-id -u http://127.0.0.1:9001
+```
+
+```text
+Error [NOT_FOUND]: cancel failed: failed to cancel: cancelation failed: canceler setup failed: failed to load a task: task not found
+```
+
+## Streaming with `--stream`
+
+`send --stream` streams the result over Server-Sent Events (SSE) instead of blocking on a poll loop —
+**but only when the agent card advertises the streaming capability**. If the card does not advertise
+streaming, `a2a-cli` does not attempt a stream; it prints a note on stderr and falls back to the
+blocking request path. Behavior never changes silently.
+
+```bash
+a2a-cli send "hello" -u http://127.0.0.1:9001 --stream
+```
+
+```text
+Message:   Hello from REST server!
+```
+
+In `-o json`, a stream emits **newline-delimited JSON (NDJSON)** — one object per line, each tagged
+with a `type`, ending in a `final` record that carries the Appendix B task fields:
+
+```bash
+a2a-cli send "hello" -u http://127.0.0.1:9001 --stream -o json
+```
+
+```json
+{"type":"message","taskId":null,"contextId":null,"state":"","message":{"role":"ROLE_AGENT","parts":[{"text":"Hello from REST server!"}]}}
+{"type":"final","taskId":null,"contextId":null,"state":"TASK_STATE_COMPLETED","message":{"role":"ROLE_AGENT","parts":[{"text":"Hello from REST server!"}]}}
+```
+
+After any stream (re)connect, `a2a-cli` reconciles the final state with a `get` before reporting, and
+if the stream drops it falls back to polling — so a dropped connection never loses the task. A task
+that ends in `INPUT_REQUIRED` exits `6` with a resume hint; errors on the stream are emitted as typed
+NDJSON error records carrying the `taskId` when one exists.
 
 ## Choosing the target agent
 
@@ -287,6 +405,78 @@ Values resolve in this order, highest priority first:
 3. the stored session;
 4. the built-in default.
 
+The service URL and transport are auto-resumed as above. Conversation **identifiers** (the
+`contextId` and the latest `taskId`) are only resumed when you ask for them — see below.
+
+> **Known limitation (CO-9).** The session store persists the **transport** alongside the service
+> URL, and precedence is applied per field (explicit flag > env > session > default). So if you point
+> a later `send` at a *different* server with a fresh `-u` but don't also pass `--transport`, the
+> **stored** transport is still applied — and if the new server's card doesn't offer it, the command
+> fails with a usage error (exit `2`):
+>
+> ```text
+> Error [USAGE]: agent card does not offer transport http-json
+> ```
+>
+> This is a documented precedence interaction, not a bug. When switching to a different
+> server or transport, either pass `--transport` explicitly or run `a2a-cli session clear` first.
+> (Tracked as Tier-2 follow-up CO-9.)
+
+## Continuing a conversation
+
+The session store also remembers the last `contextId` and `taskId`, but a bare `send` never silently
+attaches to them. To resume, opt in explicitly:
+
+- `--continue` reuses the stored `contextId`, so the next `send` is a **new task within the same
+  conversation**.
+- `--last` additionally sends **against the stored task** (the latest `taskId`) — for example, to
+  reply to a task that stopped in `INPUT_REQUIRED`.
+
+```bash
+a2a-cli send "and here's the follow-up" --continue
+```
+
+Explicit `--context-id` / `--task-id` always override the stored values. If there is no stored
+session to resume, `--continue`/`--last` is a usage error (exit `2`):
+
+```text
+Error [USAGE]: no stored session to resume (--continue/--last); run a send first or pass --context-id/--task-id
+```
+
+If the stored session recorded no task (for example, an agent that replies with a direct message
+rather than opening a task), `--last` warns on stderr and sends a new message instead of failing.
+
+## Managing the session store
+
+Inspect the store with `session show` (or just `session`), which prints its path and current
+contents and never touches the network:
+
+```bash
+a2a-cli session show
+```
+
+```text
+Path:      /home/you/.config/a2a-cli/session.json
+Context:   (unknown)
+Last Task: (unknown)
+Service:   http://127.0.0.1:9001
+Transport: http-json
+Updated:   2026-08-07T20:01:33Z
+```
+
+Clear it with `session clear` (idempotent — clearing when nothing is stored is not an error):
+
+```bash
+a2a-cli session clear
+```
+
+```text
+session cleared: /home/you/.config/a2a-cli/session.json
+```
+
+The store is written atomically with `0600` permissions, and the persisted service URL has any
+embedded credentials stripped. Caller-supplied credentials are **never** written to disk.
+
 ## Credentials
 
 Attach caller-supplied credentials to every request:
@@ -302,28 +492,41 @@ a2a-cli send "hello" -u https://agent.example.com --api-key "$KEY"
 a2a-cli send "hello" -u https://agent.example.com -H "X-Tenant: acme" -H "X-Env: prod"
 ```
 
-Each of these can also come from the environment (`A2A_CLI_BEARER`, `A2A_CLI_API_KEY`). The
-hello-world sample server requires no auth, so these flags are accepted but have no visible effect
-against it; use them with an agent that enforces authentication.
+The bearer token and API key can also come from the environment — `A2A_BEARER` and `A2A_API_KEY`
+(note: these are **not** the `A2A_CLI_`-prefixed config variables). An explicit flag wins over the
+environment variable. The Go hello-world sample server requires no auth, so these flags are accepted
+but have no visible effect against it; use them with an agent that enforces authentication.
+
+**Where credentials are sent.** Credentials are attached per request to the selected interface when
+it is same-origin with the card. They are **withheld** from a target that is cross-origin (a
+different host than the card was fetched from) or downgraded (an `http` interface reached from an
+`https`-fetched card) — `a2a-cli` warns on stderr and sends nothing. Re-run with
+`--allow-cross-origin-credentials` to forward them anyway (this also warns, and trusts that target
+for the whole request lifecycle, including any redirects it issues). The agent-card fetch itself
+never carries credentials.
 
 > **Security:** never hard-code secrets into scripts or commit them. Prefer environment variables or
 > a secrets manager, and pass them in as shown above.
 
 ## Transport and protocol version
 
-Tier 1 speaks **HTTP+JSON** only. Transport is normally chosen for you from the agent card (run
-`discover` to see which binding it would pick and why), but you can state it explicitly:
+`a2a-cli` speaks **HTTP+JSON** and **JSON-RPC**. Transport is normally chosen for you from the agent
+card (run `discover` to see which binding it would pick and why), but you can state it explicitly:
 
 ```bash
 a2a-cli send "hello" -u http://127.0.0.1:9001 --transport http-json
 ```
 
-- `--transport grpc` is rejected — gRPC is not supported at Tier 1 yet (usage error, exit 2).
-- `--transport jsonrpc` is only accepted if the agent's card advertises a JSON-RPC interface;
-  otherwise you get a usage error explaining the card doesn't offer it.
+- `--transport grpc` is rejected — gRPC is not supported (usage error, exit `2`).
+- `--transport jsonrpc` and `--transport http-json` are accepted only if the agent's card advertises
+  that interface; otherwise you get a usage error explaining the card doesn't offer it.
+- With no `--transport`, the client selects the card's first supported interface, falling back to
+  HTTP+JSON at your `-u` URL when the card declares no binding it speaks.
 
-`a2a-cli` signals the A2A protocol version on every request; the default is `1.0`. Override it with
-`--a2a-version` if you need to target a different version the agent supports.
+`a2a-cli` signals the A2A protocol version on every request via the `A2A-Version` header; the default
+is `1.0`. Override it with `--a2a-version` if you need to target a different version the agent
+supports. If the agent rejects the signaled version, `a2a-cli` surfaces a clear error (exit `1`,
+`a2aCode` `VERSION_NOT_SUPPORTED`) rather than silently downgrading.
 
 Use `--insecure` to skip TLS certificate verification for local development against a self-signed
 endpoint. It prints a warning to stderr:
@@ -364,17 +567,22 @@ curl -s http://127.0.0.1:9001/.well-known/agent-card.json
 ```
 
 **`Error [USAGE]: transport not supported at Tier 1: grpc`** (exit 2) — drop `--transport grpc`;
-only HTTP+JSON works today.
+gRPC is not supported. Use HTTP+JSON or JSON-RPC.
 
 **`Error [USAGE]: agent card does not offer transport jsonrpc`** (exit 2) — the card doesn't
-advertise that binding; let `a2a-cli` pick the transport, or use `--transport http-json`.
+advertise that binding; let `a2a-cli` pick the transport, or name one the card actually offers.
+
+**`Error [NOT_FOUND]: get task failed: ...task not found`** (exit 1) — the task id is unknown to the
+server (expired, cancelled long ago, or mistyped). In `-o json` the envelope carries
+`code: "NOT_FOUND"` and `a2aCode: "TASK_NOT_FOUND"`. Note that not-found has no dedicated numeric
+exit code at Tier 1, so the process exit is the generic `1`.
 
 Add `-v` for extra diagnostics on stderr while debugging.
 
 ## What's coming next
 
-Later phases of the Tier-1 build add `get` and `cancel`; streaming (`--stream`);
-`--context-id` / `--task-id` continuation with resume hints; and a bundled agent skill. This guide
-will be extended as each merges. Until then, treat any behavior not documented here as not yet
-available. Run `a2a-cli --help`, `a2a-cli send --help`, and `a2a-cli discover --help` to see the
-current surface at any time.
+The Tier-1 command surface is complete. Still to land: a bundled, self-installable agent skill
+(`SKILL.md`) and the Tier-1 conformance report, plus richer validation against an auth-enforcing and
+multi-transport server. Beyond Tier 1, gRPC transport and interactive OAuth login are planned. This
+guide will be extended as each merges. Until then, treat any behavior not documented here as not yet
+available. Run `a2a-cli --help` or `a2a-cli <command> --help` to see the current surface at any time.
