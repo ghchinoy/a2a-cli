@@ -6,9 +6,11 @@ through the options that matter day to day.
 > **What works today.** `a2a-cli` is in **alpha**, but the full Tier-1 command set is merged:
 > **`send`** (with `--stream`), **`discover`**, **`get`**, **`cancel`**, and **`session`**, over the
 > **HTTP+JSON** and **JSON-RPC** transports, plus caller-supplied authentication. gRPC, a bundled
-> agent skill, and interactive OAuth login are **not** available yet. Everything in this guide has
-> been verified against the built binary run against a live Go sample server; nothing here is
-> aspirational.
+> agent skill, and interactive OAuth login are **not** available yet. Every runnable example below
+> was captured from the built binary run against a live Go sample server. A few behaviors that need
+> a richer fixture — auth enforcement, protocol-version negotiation, cross-origin credential
+> handling, and exit codes 4–7 — are described from the spec and implementation (unit-tested) and
+> are tracked in the [test plan](test-plan.md).
 
 ## Contents
 

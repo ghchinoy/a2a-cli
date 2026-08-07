@@ -34,7 +34,8 @@ result as readable text or machine-readable JSON. Built on the official
 
 ## Installation
 
-Requires **Go 1.26+**. Build from source:
+Not published to any package registry yet — during the alpha, build from source. Requires
+**Go 1.26+**:
 
 ```bash
 git clone https://github.com/ghchinoy/a2a-cli.git
