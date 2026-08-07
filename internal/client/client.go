@@ -321,6 +321,156 @@ func (c *Client) Send(ctx context.Context, req SendRequest) (*envelope.TaskResul
 	return envelope.FromSendResult(res), nil
 }
 
+// ErrStreamingUnsupported reports that the resolved agent card does not advertise
+// the streaming capability (Capabilities.Streaming == false). SendStream returns it
+// WITHOUT attempting a stream so the caller can fall back to the blocking poll path
+// (spec §11.3 capability gate). It is a sentinel: callers use errors.Is to detect it.
+var ErrStreamingUnsupported = errors.New("agent card does not advertise the streaming capability")
+
+// StreamHandler is invoked with each normalized streaming event AS IT ARRIVES
+// (spec §7.2). Returning a non-nil error stops consumption and is surfaced by
+// SendStream. The handler receives envelope types only — never SDK types — so the
+// command layer stays free of wire concerns (import boundary, design §3.2).
+type StreamHandler func(envelope.StreamEvent) error
+
+// SupportsStreaming reports whether the resolved agent card advertises the
+// streaming capability (spec §11.3). The command layer checks this to gate the
+// stream attempt and fall back to blocking without ever attempting a stream.
+func (c *Client) SupportsStreaming() bool {
+	return c.card != nil && c.card.Capabilities.Streaming
+}
+
+// SendStream sends a message and consumes the SDK streaming iterator
+// (sdk.SendStreamingMessage -> iter.Seq2[a2a.Event, error]), translating each event
+// to an envelope.StreamEvent and passing it to handler as it arrives (spec §7.2).
+// It returns the running snapshot accumulated from the events (so the caller retains
+// the taskId for reconcile/fallback even on a mid-stream drop) and an error:
+//   - ErrStreamingUnsupported when the card does not advertise streaming (no attempt);
+//   - a KindTimeout error when the context deadline expires mid-stream (never hangs);
+//   - context.Canceled on SIGINT (the caller keeps the already-surfaced taskId);
+//   - a classified error on any other stream failure (the caller falls back to poll).
+//
+// Consumption stops as soon as the snapshot reaches a terminal or interrupted state
+// so a paused (INPUT_REQUIRED/AUTH_REQUIRED) or finished task never waits for events
+// that will not come (spec §7.2/§8.2 "MUST NOT deadlock"). The A2A-Version header
+// stays non-empty on the streaming request: it rides the same version-pinned
+// interface as send/get/cancel (spec §11.2), so no extra wiring is needed here.
+func (c *Client) SendStream(ctx context.Context, req SendRequest, handler StreamHandler) (*envelope.TaskResult, error) {
+	if !c.SupportsStreaming() {
+		return nil, ErrStreamingUnsupported
+	}
+	// Bound the whole stream on the context when --timeout is set (audit M-1 / spec
+	// §7.2 never hang); the per-request http.Client timeout is the always-on net.
+	if c.timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, c.timeout)
+		defer cancel()
+	}
+	msg := a2a.NewMessage(a2a.MessageRoleUser, a2a.NewTextPart(req.Text))
+	if req.ContextID != "" {
+		msg.ContextID = req.ContextID
+	}
+	if req.TaskID != "" {
+		msg.TaskID = a2a.TaskID(req.TaskID)
+	}
+
+	snap := &envelope.TaskResult{State: envelope.StateUnspecified}
+	var haveAny bool
+	var streamErr error
+
+	for ev, err := range c.sdk.SendStreamingMessage(ctx, &a2a.SendMessageRequest{Message: msg}) {
+		if err != nil {
+			streamErr = classifyStream(ctx, err, "stream failed")
+			break
+		}
+		se := envelope.FromEvent(ev)
+		haveAny = true
+		applyStreamEvent(snap, se)
+		if handler != nil {
+			if herr := handler(se); herr != nil {
+				streamErr = herr
+				break
+			}
+		}
+		if envelope.IsTerminal(snap.State) || envelope.IsInterrupted(snap.State) {
+			break
+		}
+	}
+	if !haveAny && streamErr == nil {
+		// An empty stream (200 then immediate EOF, or a stall bounded by the context)
+		// yields nothing to render or reconcile; report it so the caller falls back.
+		streamErr = classifyStream(ctx, errors.New("stream produced no events"), "stream failed")
+	}
+	return snap, streamErr
+}
+
+// applyStreamEvent folds a normalized streaming event into the running snapshot so
+// the accumulated TaskResult always reflects the latest known ids/state/content.
+// It operates purely on envelope types.
+func applyStreamEvent(snap *envelope.TaskResult, se envelope.StreamEvent) {
+	if se.TaskID != nil {
+		snap.TaskID = se.TaskID
+	}
+	if se.ContextID != nil {
+		snap.ContextID = se.ContextID
+	}
+	switch se.Type {
+	case envelope.StreamTypeTask:
+		if se.State != "" {
+			snap.State = se.State
+		}
+		snap.Artifacts = append([]envelope.Artifact(nil), se.Artifacts...)
+		if se.Message != nil {
+			snap.Message = se.Message
+		}
+	case envelope.StreamTypeStatus:
+		if se.State != "" {
+			snap.State = se.State
+		}
+		if se.Message != nil {
+			snap.Message = se.Message
+		}
+	case envelope.StreamTypeArtifact:
+		if se.Artifact != nil {
+			snap.Artifacts = append(snap.Artifacts, *se.Artifact)
+		}
+	case envelope.StreamTypeMessage:
+		if se.Message != nil {
+			snap.Message = se.Message
+		}
+		// A bare Message reply represents a completed interaction (as FromMessage
+		// does for the non-streaming path); do not overwrite a real task state.
+		if snap.State == envelope.StateUnspecified {
+			snap.State = envelope.StateCompleted
+		}
+	}
+}
+
+// classifyStream maps a streaming error to a normalized clierr.Error, giving the
+// context signals priority: a deadline is a TIMEOUT (exit 7, spec §7.2 never hang),
+// a cancellation (SIGINT) propagates as context.Canceled so the caller can keep the
+// already-surfaced taskId, and everything else defers to the shared classify.
+func classifyStream(ctx context.Context, err error, msg string) error {
+	if err == nil {
+		return nil
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		if errors.Is(ctxErr, context.DeadlineExceeded) {
+			return clierr.Wrap(clierr.KindTimeout, msg+": timed out while streaming", err)
+		}
+		if errors.Is(ctxErr, context.Canceled) {
+			return ctxErr
+		}
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return clierr.Wrap(clierr.KindTimeout, msg+": timed out while streaming", err)
+	}
+	if errors.Is(err, context.Canceled) {
+		return err
+	}
+	return classify(err, msg)
+}
+
 // GetOpts configures a GetTask call (design §3.3). HistoryLength, when non-nil,
 // is threaded to the SDK as the server-side history bound (`get --history <n>`).
 // IncludeArtifacts is a client-side content control: the SDK always returns the

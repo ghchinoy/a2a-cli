@@ -70,11 +70,142 @@ type SessionView struct {
 	UpdatedAt    string `json:"updatedAt,omitempty"`
 }
 
+// Stream event type discriminators (spec §7.2). Each streamed event is normalized
+// to a StreamEvent carrying one of these in its Type field; the value is also the
+// `type` field emitted on every NDJSON line in `-o json --stream` (Appendix B).
+const (
+	StreamTypeTask     = "task"     // the initial Task snapshot (MUST be first, §7.2)
+	StreamTypeStatus   = "status"   // a TaskStatusUpdateEvent
+	StreamTypeArtifact = "artifact" // a TaskArtifactUpdateEvent
+	StreamTypeMessage  = "message"  // a bare Message (e.g. the hello-world reply)
+	StreamTypeFinal    = "final"    // the reconciled terminal result (§7.3)
+	StreamTypeError    = "error"    // a mid-stream/terminal error or cancel (§9.1)
+	StreamTypeUnknown  = "unknown"  // an event of an unrecognized concrete type
+)
+
+// StreamEvent is the normalized streaming event — the ONLY streaming type that
+// crosses the internal/client -> internal/cli boundary (import boundary, design
+// §3.2: cli never sees SDK a2a.Event types) AND the single object shape emitted as
+// one NDJSON line in `-o json --stream` (spec §9.1 / Appendix B). Type discriminates
+// the event; the task-operation fields (taskId, contextId, state) are always present
+// (null/empty when the event does not carry them) so terminal/final events satisfy
+// Appendix B without a separate shape. Artifact/Artifacts/Message are populated per
+// type. This is additive to the frozen Appendix B contract (design §4.2).
+type StreamEvent struct {
+	Type      string     `json:"type"`
+	TaskID    *string    `json:"taskId"`
+	ContextID *string    `json:"contextId"`
+	State     string     `json:"state"`
+	Message   *Message   `json:"message,omitempty"`
+	Artifact  *Artifact  `json:"artifact,omitempty"`  // set on an artifact event
+	Artifacts []Artifact `json:"artifacts,omitempty"` // set on the reconciled final event
+}
+
+// FromEvent normalizes a single SDK streaming event (a2a.Event, a sealed union of
+// *a2a.Task | *a2a.TaskStatusUpdateEvent | *a2a.TaskArtifactUpdateEvent |
+// *a2a.Message) into a StreamEvent. This is the SDK -> envelope translation seam
+// for streaming (design §3.2): it lives here, in internal/envelope, so internal/cli
+// consumes StreamEvent only and never imports SDK types.
+func FromEvent(ev a2a.Event) StreamEvent {
+	switch v := ev.(type) {
+	case *a2a.Task:
+		tr := FromTask(v)
+		return StreamEvent{
+			Type:      StreamTypeTask,
+			TaskID:    tr.TaskID,
+			ContextID: tr.ContextID,
+			State:     tr.State,
+			Artifacts: tr.Artifacts,
+			Message:   tr.Message,
+		}
+	case *a2a.TaskStatusUpdateEvent:
+		se := StreamEvent{Type: StreamTypeStatus, State: string(v.Status.State)}
+		setIDs(&se, string(v.TaskID), v.ContextID)
+		if v.Status.Message != nil {
+			se.Message = messageFromSDK(v.Status.Message)
+		}
+		return se
+	case *a2a.TaskArtifactUpdateEvent:
+		se := StreamEvent{Type: StreamTypeArtifact}
+		setIDs(&se, string(v.TaskID), v.ContextID)
+		if v.Artifact != nil {
+			a := artifactFromSDK(v.Artifact)
+			se.Artifact = &a
+		}
+		return se
+	case *a2a.Message:
+		se := StreamEvent{Type: StreamTypeMessage, Message: messageFromSDK(v)}
+		setIDs(&se, string(v.TaskID), v.ContextID)
+		return se
+	default:
+		return StreamEvent{Type: StreamTypeUnknown}
+	}
+}
+
+// setIDs fills the pointer identifier fields of a StreamEvent, leaving them nil
+// (JSON null) when the event carries no id — never fabricating ids (design §6.1).
+func setIDs(se *StreamEvent, taskID, contextID string) {
+	if taskID != "" {
+		se.TaskID = &taskID
+	}
+	if contextID != "" {
+		se.ContextID = &contextID
+	}
+}
+
+// FinalStreamEvent builds the terminal `final` NDJSON record from the reconciled
+// TaskResult (spec §7.3: the authoritative final state is the reconciled get). It
+// carries the full Appendix B task-operation fields so the terminal line is a
+// complete result, not just a delta.
+func FinalStreamEvent(tr *TaskResult) StreamEvent {
+	se := StreamEvent{Type: StreamTypeFinal}
+	if tr != nil {
+		se.TaskID = tr.TaskID
+		se.ContextID = tr.ContextID
+		se.State = tr.State
+		se.Artifacts = tr.Artifacts
+		se.Message = tr.Message
+	}
+	return se
+}
+
 // CLIError is the Appendix B error object — normalized across transports (§9.4).
 type CLIError struct {
 	Code    string `json:"code"`
 	Message string `json:"message"`
 	A2ACode any    `json:"a2aCode"`
+}
+
+// StreamErrorEvent is the TYPED terminal error record on the `-o json --stream`
+// NDJSON path (spec §9.1: every object MUST carry a `type`). When a stream ends in
+// an error or cancel, event lines have already been written to stdout, so the
+// terminal error must ALSO be a typed NDJSON record — not the untyped one-shot
+// Appendix B error envelope — or the trailing object breaks the one-object-per-line
+// contract. It carries the Appendix B error fields (code/message/a2aCode) plus the
+// task-operation ids when known (null when the stream never surfaced a task), and a
+// `type` of StreamTypeError. The non-streaming error envelope (CLIError) is
+// unchanged; this shape is additive and used only on the streaming NDJSON path.
+type StreamErrorEvent struct {
+	Type      string  `json:"type"`
+	Code      string  `json:"code"`
+	Message   string  `json:"message"`
+	A2ACode   any     `json:"a2aCode"`
+	TaskID    *string `json:"taskId"`
+	ContextID *string `json:"contextId"`
+}
+
+// ErrorStreamEvent builds the typed terminal error record from a normalized
+// Appendix B error plus the task ids known at the point of failure (either may be
+// nil — never fabricate ids, design §6.1).
+func ErrorStreamEvent(ce CLIError, taskID, contextID *string) StreamErrorEvent {
+	return StreamErrorEvent{
+		Type:      StreamTypeError,
+		Code:      ce.Code,
+		Message:   ce.Message,
+		A2ACode:   ce.A2ACode,
+		TaskID:    taskID,
+		ContextID: contextID,
+	}
 }
 
 // Message is a normalized message (e.g. the agent's reply when the server
