@@ -1,3 +1,17 @@
+> # ⚠️ DEPRECATED — this repository is no longer maintained
+>
+> **`ghchinoy/a2a-cli` is deprecated and no longer maintained.** The community has
+> standardized on the official A2A command-line tool:
+>
+> ### 👉 https://github.com/a2aproject/a2a-cli
+>
+> Please migrate. See the **[Migration guide → MIGRATION.md](MIGRATION.md)** for how to
+> install the official `a2a` tool and map the commands and behaviors you rely on here.
+>
+> The content below is retained for historical reference only.
+
+---
+
 # a2a-cli
 
 ![status: alpha](https://img.shields.io/badge/status-alpha-orange)
