@@ -14,6 +14,7 @@ package cli
 import (
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 	"time"
@@ -150,12 +151,20 @@ func NewRootCommand() *cobra.Command {
 // the Appendix B {code,message,a2aCode} object on stdout, text mode a stderr
 // diagnostic. The exit-code mapping stays the single tail in main.
 func Execute() error {
+	printDeprecationNotice(os.Stderr)
 	root := NewRootCommand()
 	err := root.Execute()
 	if err != nil {
 		renderTopLevelError(root.Flags(), err)
 	}
 	return err
+}
+
+// printDeprecationNotice writes a single-line deprecation notice to stderr on
+// every invocation. It is written to stderr (never stdout) so it can never
+// corrupt machine-readable `-o json` output that a caller pipes from stdout.
+func printDeprecationNotice(w io.Writer) {
+	fmt.Fprintln(w, "DEPRECATED: ghchinoy/a2a-cli is no longer maintained; use the official tool at https://github.com/a2aproject/a2a-cli (see MIGRATION.md).")
 }
 
 // renderTopLevelError surfaces an error that no command renderer has handled yet.
